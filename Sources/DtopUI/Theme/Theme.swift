@@ -79,7 +79,9 @@ public struct Theme: Sendable, Equatable {
 
     // MARK: - Built-in themes
 
-    public static let builtIn: [Theme] = [.harbor, .daylight, .midnight, .ansi, .monochrome]
+    public static let builtIn: [Theme] = [
+        .harbor, .daylight, .midnight, .ember, .forest, .glacier, .dusk, .contrast, .ansi, .monochrome
+    ]
 
     public static func named(_ name: String) -> Theme? {
         let lowered = name.trimmed().lowercased()
