@@ -11,6 +11,14 @@ import ucrt
 
 import Foundation
 
+#if os(Windows)
+/// Win32 `BOOL` imports as `WindowsBool` on older toolchains and as `Bool` from Swift 6.2.
+@inline(__always) func win32Succeeded(_ value: Bool) -> Bool { value }
+#if !compiler(>=6.2)
+@inline(__always) func win32Succeeded(_ value: WindowsBool) -> Bool { value.boolValue }
+#endif
+#endif
+
 #if !os(Windows)
 private func systemRead(_ fd: Int32, _ buffer: UnsafeMutableRawPointer?, _ count: Int) -> Int {
     #if canImport(Darwin)
@@ -93,8 +101,8 @@ public final class Terminal: @unchecked Sendable {
         #if os(Windows)
         let input = GetStdHandle(STD_INPUT_HANDLE)
         let output = GetStdHandle(STD_OUTPUT_HANDLE)
-        guard GetConsoleMode(input, &originalInputMode).boolValue,
-              GetConsoleMode(output, &originalOutputMode).boolValue else {
+        guard win32Succeeded(GetConsoleMode(input, &originalInputMode)),
+              win32Succeeded(GetConsoleMode(output, &originalOutputMode)) else {
             throw TerminalError.notATerminal
         }
         let enableProcessedInput: DWORD = 0x0001
@@ -109,11 +117,11 @@ public final class Terminal: @unchecked Sendable {
         var inputMode = originalInputMode
         inputMode &= ~(enableProcessedInput | enableLineInput | enableEchoInput | enableQuickEdit)
         inputMode |= enableExtendedFlags | enableVirtualTerminalInput
-        guard SetConsoleMode(input, inputMode).boolValue else {
+        guard win32Succeeded(SetConsoleMode(input, inputMode)) else {
             throw TerminalError.configurationFailed("SetConsoleMode(input) failed with error \(GetLastError())")
         }
         let outputMode = originalOutputMode | enableProcessedOutput | enableVirtualTerminalProcessing
-        guard SetConsoleMode(output, outputMode).boolValue else {
+        guard win32Succeeded(SetConsoleMode(output, outputMode)) else {
             _ = SetConsoleMode(input, originalInputMode)
             throw TerminalError.configurationFailed(
                 "SetConsoleMode(output) failed with error \(GetLastError()) — Windows 10 1809 or newer is required")
@@ -158,7 +166,7 @@ public final class Terminal: @unchecked Sendable {
     public func size(environment: [String: String] = ProcessInfo.processInfo.environment) -> TerminalSize {
         #if os(Windows)
         var info = CONSOLE_SCREEN_BUFFER_INFO()
-        if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info).boolValue {
+        if win32Succeeded(GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) {
             let columns = Int(info.srWindow.Right) - Int(info.srWindow.Left) + 1
             let rows = Int(info.srWindow.Bottom) - Int(info.srWindow.Top) + 1
             if columns > 0, rows > 0 { return TerminalSize(columns: columns, rows: rows) }
@@ -185,7 +193,7 @@ public final class Terminal: @unchecked Sendable {
         let ok = buffer.withUnsafeMutableBytes { raw in
             ReadFile(GetStdHandle(STD_INPUT_HANDLE), raw.baseAddress, DWORD(raw.count), &count, nil)
         }
-        guard ok.boolValue else { return [] }
+        guard win32Succeeded(ok) else { return [] }
         return Array(buffer[..<Int(count)])
         #else
         while true {

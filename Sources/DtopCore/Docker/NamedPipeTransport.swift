@@ -2,6 +2,12 @@
 import WinSDK
 import Foundation
 
+/// Win32 `BOOL` imports as `WindowsBool` on older toolchains and as `Bool` from Swift 6.2.
+@inline(__always) func win32Succeeded(_ value: Bool) -> Bool { value }
+#if !compiler(>=6.2)
+@inline(__always) func win32Succeeded(_ value: WindowsBool) -> Bool { value.boolValue }
+#endif
+
 /// A synchronous handle to a Windows named pipe such as `\\.\pipe\docker_engine`.
 final class NamedPipeConnection: DockerConnection, @unchecked Sendable {
     private let lock = NSLock()
@@ -30,7 +36,7 @@ final class NamedPipeConnection: DockerConnection, @unchecked Sendable {
             let ok = bytes.withUnsafeBytes { raw in
                 WriteFile(pipe, raw.baseAddress! + offset, DWORD(bytes.count - offset), &written, nil)
             }
-            guard ok.boolValue else {
+            guard win32Succeeded(ok) else {
                 throw DockerError.io("WriteFile failed with Windows error \(GetLastError())")
             }
             offset += Int(written)
@@ -44,7 +50,7 @@ final class NamedPipeConnection: DockerConnection, @unchecked Sendable {
         let ok = buffer.withUnsafeMutableBytes { raw in
             ReadFile(pipe, raw.baseAddress!, DWORD(raw.count), &count, nil)
         }
-        if !ok.boolValue {
+        if !win32Succeeded(ok) {
             let error = GetLastError()
             switch error {
             case DWORD(ERROR_BROKEN_PIPE), DWORD(ERROR_PIPE_NOT_CONNECTED):
@@ -109,7 +115,7 @@ public struct NamedPipeTransport: DockerTransport {
                 let available = path.withCString(encodedAs: UTF16.self) { name in
                     WaitNamedPipeW(name, busyWaitMilliseconds)
                 }
-                if available.boolValue { continue }
+                if win32Succeeded(available) { continue }
             }
             let reason = error == DWORD(ERROR_FILE_NOT_FOUND)
                 ? "pipe not found"
