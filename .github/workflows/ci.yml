@@ -5,34 +5,78 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  lint-and-validate:
-    name: Lint & Validate
-    runs-on: ubuntu-24.04
-
-    permissions:
-      contents: read
+  build-and-test:
+    name: Build & test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: macOS
+            os: macos-15
+          - name: Windows
+            os: windows-2022
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Swift
+      - name: Set up Swift (Linux)
+        if: runner.os == 'Linux'
         uses: swift-actions/setup-swift@v2
         with:
           swift-version: "6.0"
 
-      # ---------------------------------------------------------------
-      # Add language-specific lint, build, and test steps below.
-      # The steps below are general-purpose checks suitable for any repo.
-      # ---------------------------------------------------------------
+      - name: Set up Swift (Windows)
+        if: runner.os == 'Windows'
+        uses: compnerd/gha-setup-swift@main
+        with:
+          branch: swift-6.0.3-release
+          tag: 6.0.3-RELEASE
 
-      - name: Build Swift package
+      # macOS runners ship Xcode 16+, whose toolchain already speaks Swift 6.
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Build
         run: swift build
 
-      - name: Test Swift package
+      - name: Test
         run: swift test
+
+      # GitHub's Linux runners have a Docker daemon, so exercise the real Engine API there.
+      - name: Integration tests (real Docker daemon)
+        if: runner.os == 'Linux'
+        env:
+          DTOP_INTEGRATION: "1"
+        run: swift test --filter Integration
+
+      - name: Smoke test the executable
+        shell: bash
+        run: |
+          swift run dtop --version
+          swift run dtop --help > /dev/null
+          swift run dtop --list-themes
+
+      - name: Smoke test --once against Docker (Linux)
+        if: runner.os == 'Linux'
+        run: swift run dtop --once
+
+  lint-and-validate:
+    name: Lint & Validate
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Install YAML validator dependency
         run: python3 -m pip install --disable-pip-version-check --user pyyaml
@@ -64,3 +108,11 @@ jobs:
             exit 1
           fi
           echo "No secret patterns found."
+
+      - name: Check Swift sources for trailing whitespace
+        run: |
+          if grep -rnE "[[:space:]]+$" --include="*.swift" Sources Tests; then
+            echo "Trailing whitespace found (see lines above)."
+            exit 1
+          fi
+          echo "No trailing whitespace."

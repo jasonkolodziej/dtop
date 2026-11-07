@@ -1,8 +1,5 @@
-let profile = AppProfile.bootstrap
+import Foundation
+import DtopApp
 
-print("\(profile.name): \(profile.tagline)")
-print("Bootstrap status: initialized")
-print("Planned capabilities:")
-for capability in profile.capabilities {
-    print("- \(capability)")
-}
+let status = await DtopMain.run(arguments: Array(CommandLine.arguments.dropFirst()))
+exit(status)
