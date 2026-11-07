@@ -14,7 +14,7 @@ on:
 jobs:
   # This job MUST be named `copilot-setup-steps` for the cloud agent to pick it up.
   copilot-setup-steps:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     # Minimal permissions required for the setup steps below.
     # Copilot is granted its own token for its own operations.
