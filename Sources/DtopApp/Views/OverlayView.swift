@@ -35,10 +35,12 @@ enum OverlayView {
         let inner = Box.draw(into: &buffer, rect: rect, title: "hosts (\(hosts.count))", label: "⏎ switch · esc close",
                              borderStyle: dialog.foreground(theme[.dialogBorder]),
                              titleStyle: dialog.foreground(theme[.title]).bold, characters: theme.border)
+        // Size the name column to the names, so long endpoints keep the rest of the width.
+        let nameWidth = min(28, max(6, (hosts.map { TextWidth.of($0.name) }.max() ?? 0) + 2))
         let columns = [
             TableColumn("", width: .fixed(2)),
-            TableColumn("HOST", width: .flexible(min: 10, weight: 1)),
-            TableColumn("STATUS", width: .fixed(10)),
+            TableColumn("HOST", width: .fixed(nameWidth)),
+            TableColumn("STATUS", width: .fixed(12)),
             TableColumn("UP", width: .fixed(7), alignment: .right),
             TableColumn("CPU%", width: .fixed(6), alignment: .right, priority: 2),
             TableColumn("MEM", width: .fixed(8), alignment: .right, priority: 3),
@@ -56,7 +58,8 @@ enum OverlayView {
                 TableCell((index == context.state.activeHost ? "▸ " : "  ") + host.name, style: theme.style(.title)),
                 TableCell(HeaderView.connectionSymbol(host.connection) + " " + status.0, style: theme.style(status.1)),
                 TableCell(host.total > 0 || host.connection.isConnected ? "\(host.running)/\(host.total)" : "-"),
-                TableCell(host.cpuPercent.map { Format.percent($0, decimals: 1) } ?? "-"),
+                // Share of the whole host, like the cpu box ("x% of N cpu").
+                TableCell(host.cpuPercent.map { Format.percent($0 / Double(max(1, host.cpuCount)), decimals: 1) } ?? "-"),
                 TableCell(host.memoryUsed.map { Format.compactBytes(Double($0)) } ?? "-"),
                 TableCell(host.description, style: theme.style(.muted))
             ]

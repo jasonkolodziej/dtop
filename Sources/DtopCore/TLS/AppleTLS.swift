@@ -143,7 +143,18 @@ final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
             connection.cancel()
             throw DockerError.timedOut("socket write")
         }
-        if let error = outcome { throw describe(error, duringHandshake: false) }
+        if let error = outcome {
+            state.lock.lock()
+            let receivedAny = state.receivedAny
+            state.lock.unlock()
+            // A daemon that refuses our client certificate drops the connection right after the
+            // handshake, so the request write is what fails.
+            if !receivedAny, case .posix(let code) = error, [.ENOTCONN, .EPIPE, .ECONNRESET].contains(code) {
+                throw DockerError.tls("\(endpoint) closed the connection before answering (\(error)) — "
+                    + TLSSupport.closedDuringHandshakeHint(configuration))
+            }
+            throw describe(error, duringHandshake: false)
+        }
     }
 
     func read(maxLength: Int) throws -> [UInt8] {

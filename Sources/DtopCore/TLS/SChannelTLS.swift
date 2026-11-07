@@ -307,6 +307,8 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
     private let lock = NSLock()
     private var hasContext = false
     private var isClosed = false
+    /// The server sent close_notify: the stream is over, whatever the socket does.
+    private var peerClosed = false
     private var encrypted: [UInt8] = []
     private var plaintext: [UInt8] = []
     private var header = 0
@@ -542,6 +544,7 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
         defer { lock.unlock() }
         guard !isClosed else { throw DockerError.cancelled }
         while plaintext.isEmpty {
+            if peerClosed { return [] }
             if !encrypted.isEmpty {
                 let buffers = SecBuffers(4)
                 var extra: [UInt8] = []
@@ -549,7 +552,9 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
                     buffers.set(0, type: SSPILibrary.bufferData, length: raw.count, data: raw.baseAddress)
                     for index in 1..<4 { buffers.set(index, type: SSPILibrary.bufferEmpty, length: 0, data: nil) }
                     let status = library.decrypt(context.pointer, buffers.descriptor.pointer, 0, nil)
-                    if status == SSPILibrary.ok || status == SSPILibrary.renegotiate || status == SSPILibrary.contextExpired {
+                    // Only a successful decrypt yields plaintext; on close_notify (CONTEXT_EXPIRED) the
+                    // buffers still describe the alert record, which is not data.
+                    if status == SSPILibrary.ok || status == SSPILibrary.renegotiate {
                         for index in 0..<4 {
                             guard let data = buffers.data(index) else { continue }
                             let length = buffers.length(index)
@@ -571,7 +576,7 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
                 case SSPILibrary.contextExpired:
                     // close_notify: the server finished the stream.
                     encrypted = []
-                    if plaintext.isEmpty { return [] }
+                    peerClosed = true
                     continue
                 case SSPILibrary.renegotiate:
                     // Post-handshake messages (TLS 1.3 tickets, key updates): feed them back.

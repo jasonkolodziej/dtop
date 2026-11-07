@@ -469,33 +469,35 @@ public final class AppController {
     }
 
     /// Which container's logs should be streaming right now, if any.
-    private func wantedLogStream() -> (host: Int, containerID: String, isActive: Bool)? {
+    private func wantedLogStream() -> LogStreamPolicy.Target? {
         guard state.showDetails, state.detailPane == .logs,
               ScreenLayout.compute(size: size, showDetails: true)?.detail != nil,
               let container = ListModel.selectedItem(snapshot: snapshot, state: state)?.container else { return nil }
-        return (active, container.id, container.state.isActive)
+        return LogStreamPolicy.Target(host: active, containerID: container.id, isActive: container.state.isActive)
     }
 
-    /// Starts, keeps or stops the followed log stream to match the selection. `restart` retries
-    /// a stream that ended for a container that is still running.
+    /// Starts, keeps or stops the followed log stream to match the selection (`LogStreamPolicy`).
+    /// `restart` is a scheduled reconnect for a running container whose stream dropped.
     private func updateLogStream(restart: Bool) {
         let wanted = wantedLogStream()
-        if let current = logStream, let wanted, current.host == wanted.host, current.containerID == wanted.containerID {
+        let existing = wanted.flatMap { target in snapshot.detail?.containerID == target.containerID ? snapshot.detail : nil }
+        let decision = LogStreamPolicy.decide(current: logStream.map { ($0.host, $0.containerID) }, wanted: wanted,
+                                              state: existing?.logState, reconnectPending: logRestartAt != nil,
+                                              isReconnect: restart)
+        switch decision {
+        case .keep, .wait:
             return
-        }
-        if let current = logStream {
-            current.task.cancel()
+        case .stop:
+            logStream?.task.cancel()
             logStream = nil
-        }
-        guard let wanted else {
             logRestartAt = nil
             return
+        case .start:
+            logStream?.task.cancel()
+            logStream = nil
+            logRestartAt = nil
         }
-        let existing = snapshot.detail?.containerID == wanted.containerID ? snapshot.detail : nil
-        // A stopped container's stream already delivered everything; don't loop on it.
-        if !restart, case .ended? = existing?.logState, !wanted.isActive { return }
-        if !restart, logRestartAt != nil, existing != nil { return }
-        logRestartAt = nil
+        guard let wanted else { return }
 
         var detail = existing ?? ContainerDetailData(containerID: wanted.containerID)
         detail.logs = []
