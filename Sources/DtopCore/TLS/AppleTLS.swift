@@ -25,6 +25,14 @@ final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
         var trustFailure: CFError?
         var cancelled = false
         var receivedAny = false
+        /// Set when the connection fails after it was ready (e.g. the daemon rejected us).
+        var failure: NWError?
+
+        var currentFailure: NWError? {
+            lock.lock()
+            defer { lock.unlock() }
+            return failure
+        }
 
         func set(trustFailure error: CFError?) {
             lock.lock()
@@ -43,14 +51,14 @@ final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
             semaphore.signal()
         }
 
-        /// Waits; nil means the timeout passed first.
-        func wait(seconds: Int) -> Value? {
-            if seconds > 0 {
-                guard semaphore.wait(timeout: .now() + .seconds(seconds)) == .success else { return nil }
-            } else {
-                semaphore.wait()
+        /// Waits; nil means the timeout passed first, or `abort` became true (checked every
+        /// 100 ms, because a failed connection does not always complete pending operations).
+        func wait(seconds: Int, abort: () -> Bool = { false }) -> Value? {
+            let deadline = seconds > 0 ? DispatchTime.now() + .seconds(seconds) : DispatchTime.distantFuture
+            while true {
+                if semaphore.wait(timeout: min(deadline, .now() + .milliseconds(100))) == .success { return value }
+                if abort() || DispatchTime.now() >= deadline { return nil }
             }
-            return value
         }
     }
 
@@ -123,14 +131,24 @@ final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
             connection.cancel()
             throw DockerError.connectionFailed(endpoint: endpoint, reason: "timed out")
         }
-        connection.stateUpdateHandler = nil
         if let error = outcome {
+            connection.stateUpdateHandler = nil
             connection.cancel()
             throw describe(error, duringHandshake: true)
+        }
+        // Keep watching: a daemon that rejects our certificate fails the connection after `.ready`.
+        let watched = self.state
+        connection.stateUpdateHandler = { newState in
+            if case .failed(let error) = newState {
+                watched.lock.lock()
+                watched.failure = error
+                watched.lock.unlock()
+            }
         }
     }
 
     deinit {
+        connection.stateUpdateHandler = nil
         connection.cancel()
     }
 
@@ -139,8 +157,9 @@ final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
     func write(_ bytes: [UInt8]) throws {
         let done = Outcome<NWError?>()
         connection.send(content: Data(bytes), completion: .contentProcessed { error in done.finish(error) })
-        guard let outcome = done.wait(seconds: timeoutSeconds) else {
+        guard let outcome = done.wait(seconds: timeoutSeconds, abort: { state.currentFailure != nil }) else {
             connection.cancel()
+            if let failure = state.currentFailure { throw failedConnection(failure) }
             throw DockerError.timedOut("socket write")
         }
         if let error = outcome {
@@ -162,8 +181,9 @@ final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
         connection.receive(minimumIncompleteLength: 1, maximumLength: max(1, maxLength)) { data, _, isComplete, error in
             done.finish((data, isComplete, error))
         }
-        guard let (data, isComplete, error) = done.wait(seconds: timeoutSeconds) else {
+        guard let (data, isComplete, error) = done.wait(seconds: timeoutSeconds, abort: { state.currentFailure != nil }) else {
             connection.cancel()
+            if let failure = state.currentFailure { throw failedConnection(failure) }
             throw DockerError.timedOut("socket read")
         }
         state.lock.lock()
@@ -201,6 +221,19 @@ final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
     }
 
     // MARK: - Errors
+
+    /// The connection failed after it was ready: before any response, that is the daemon
+    /// refusing us (usually the client certificate); later, an ordinary I/O failure.
+    private func failedConnection(_ error: NWError) -> DockerError {
+        state.lock.lock()
+        let receivedAny = state.receivedAny
+        state.lock.unlock()
+        if !receivedAny {
+            return .tls("\(endpoint) closed the connection before answering (\(error)) — "
+                + TLSSupport.closedDuringHandshakeHint(configuration))
+        }
+        return describe(error, duringHandshake: false)
+    }
 
     private func describe(_ error: NWError, duringHandshake: Bool) -> DockerError {
         state.lock.lock()

@@ -23,11 +23,13 @@ This repository is **dtop**, a Swift terminal UI (in the spirit of `btop`/`htop`
   - Guard platform APIs with `#if os(Windows)` / `#if canImport(Darwin)` / `#if canImport(Glibc)`.
   - Call libc functions through the specific module (`Darwin.read`, `Glibc.connect`), not `Foundation.`.
   - Win32 `BOOL` imports as `Bool` from Swift 6.2 and as `WindowsBool` before that; use the `win32Succeeded(_:)` helper.
+  - C APIs that Swift's SDK modules don't import (OpenSSL on Linux; SSPI/SChannel and CNG on Windows) are loaded at runtime. Write their structs at explicit byte offsets (`RawStruct` in `SChannelTLS.swift`), never through assumed Swift layouts. See ADR 0003.
+- **TLS and hosts**: everything above `DockerConnection` is TLS-agnostic; `TLSTransport` picks the platform backend. Host resolution (`DockerHostResolver`) follows the Docker CLI's precedence and must stay testable through `HostEnvironment`.
 - **Stack size**: macOS secondary threads get 512 KB of stack. Avoid functions that copy large state structs many times in debug builds (CI runs the Linux tests with `ulimit -s 512` to catch this).
 - **Swift 6 language mode** with strict concurrency. Prefer `Sendable` value types. Use `@unchecked Sendable` only with real internal locking.
 - **Build and test**:
   - `swift build`
-  - `swift test`: unit tests, no daemon needed.
+  - `swift test`: unit tests, no daemon needed. TLS tests run a real `openssl s_server` and are skipped without the `openssl` tool unless `DTOP_REQUIRE_TLS_TESTS=1` (CI sets it). `DTOP_TLS_TRACE=1` traces the TLS backends.
   - `DTOP_INTEGRATION=1 swift test --filter Integration`: needs a real daemon.
 
 ## Coding Guidelines

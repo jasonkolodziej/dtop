@@ -41,7 +41,15 @@ rendering.
   each vendor supports). The details panel also shows which GPUs a container may access
   (`--gpus`, `/dev/dri`, `/dev/kfd`). Turn it off with `--no-gpu`.
 - **Process trees**: the `docker top` output for each container, shown as a PID/PPID tree.
-- **Logs**: the stdout/stderr tail with terminal escapes stripped and stderr highlighted.
+- **Live logs**: the Logs pane follows the selected container's output as it is written
+  (`logs -f`), with terminal escapes stripped and stderr highlighted. It keeps the last 5,000
+  lines and holds your place when you scroll back; `f` (or scrolling to the end) resumes.
+- **Remote and TLS daemons**: `tcp://` and `https://` endpoints with TLS configured the way the
+  Docker CLI does it (`--tlsverify`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`, client
+  certificates), plus Docker contexts. TLS uses each OS's own stack, so there are still no
+  third-party dependencies.
+- **Several hosts at once**: repeat `--host` or `--context` (or use `--all-contexts`). Every host
+  is polled; header chips show their status, `[`/`]` switch between them and `H` lists them.
 - **Management**: start, stop, restart, pause, kill and remove containers. Compose stacks get
   start/stop/restart/pause plus `up`/`down` through the Compose CLI. You can remove or prune
   images, networks and volumes. Destructive actions ask for confirmation, and **No** is focused
@@ -68,21 +76,29 @@ swift build -c release
 .build/release/dtop
 ```
 
-dtop finds Docker in this order:
+dtop finds Docker the way the Docker CLI does:
 
-1. `--host`
+1. `--host` or `--context` (both repeatable, for several hosts)
 2. `DOCKER_HOST`
-3. Well-known sockets:
+3. The active Docker context (`DOCKER_CONTEXT`, or the one `docker context use` selected)
+4. Well-known sockets:
    - Linux: `/var/run/docker.sock`, then rootless `$XDG_RUNTIME_DIR/docker.sock`
    - macOS: Docker Desktop, OrbStack, Colima and Rancher Desktop sockets
    - Windows: the `\\.\pipe\docker_engine` named pipe
 
-Supported endpoint forms are `unix://`, `npipe://` and plain-HTTP `tcp://`. For `ssh://` or TLS
-endpoints, forward the socket locally first.
+Supported endpoint forms are `unix://`, `npipe://`, `tcp://` (plain or TLS) and `https://`
+(TLS). For `ssh://` hosts, forward the socket first
+(`ssh -NL /tmp/docker.sock:/var/run/docker.sock host`) and use `unix:///tmp/docker.sock`.
 
 ```text
 dtop [options]
-  -H, --host <endpoint>     unix:///var/run/docker.sock, npipe:////./pipe/docker_engine, tcp://host:2375
+  -H, --host [name=]<endpoint>
+                            unix:///var/run/docker.sock, npipe:////./pipe/docker_engine,
+                            tcp://host:2375, https://host:2376 (repeat for several hosts)
+      --context <name>      a Docker context (repeatable); --all-contexts for every one
+      --tls / --tlsverify   TLS without / with verifying the daemon
+      --tlscacert / --tlscert / --tlskey <file>
+                            CA, client certificate and key (default ~/.docker/{ca,cert,key}.pem)
   -i, --interval <seconds>  refresh interval, 0.25-60 (default 2; accepts 500ms)
   -t, --theme <name|file>   built-in theme name or path to a .theme file
       --color <mode>        auto, truecolor, 256, 16 or none
@@ -98,7 +114,66 @@ dtop [options]
 ```
 
 `dtop --once` prints a plain table with CPU% measured over one second. It works without a TTY, so
-you can use it in scripts and CI.
+you can use it in scripts and CI. With several hosts it prints one `== name ==` section per host
+and exits with status 1 if any host could not be reached.
+
+## Remote hosts, TLS and contexts
+
+### TLS
+
+dtop reads the same settings as the Docker CLI, so a shell that already works with `docker` works
+with dtop:
+
+```bash
+DOCKER_HOST=tcp://prod.example.com:2376 DOCKER_TLS_VERIFY=1 DOCKER_CERT_PATH=/path/to/certs dtop
+```
+
+```bash
+dtop --host tcp://prod.example.com:2376 --tlsverify --tlscacert ca.pem --tlscert cert.pem --tlskey key.pem
+```
+
+- `--tlsverify` (or `DOCKER_TLS_VERIFY=1`) encrypts and checks the daemon's certificate and name,
+  against `--tlscacert` if given (only that CA is trusted), else `ca.pem` in `DOCKER_CERT_PATH`
+  or `~/.docker`, else the system's trusted roots.
+- `--tls` (or `DOCKER_TLS=1`, or an `https://` address) encrypts without verifying the daemon,
+  like the Docker CLI's `--tls`.
+- A client certificate is used when `cert.pem` and `key.pem` are present (or `--tlscert` and
+  `--tlskey` are given). Keys may be RSA or ECDSA (P-256/384/521) in PKCS#1, SEC1 or PKCS#8 PEM;
+  encrypted keys are not supported.
+- TCP addresses without a port use 2376 with TLS and 2375 without.
+- Errors say what to change: an untrusted CA, a certificate for another name, a daemon that wants
+  a client certificate (or rejected yours), or a port that doesn't speak TLS.
+
+TLS runs on each platform's own stack, with no extra dependencies:
+
+| Platform | TLS stack | Notes |
+| --- | --- | --- |
+| Linux | OpenSSL 1.1.1 or 3.x, loaded at runtime | `libssl` must be installed (it is on virtually every distribution) |
+| macOS | Network.framework | Client certificates are used from the PEM files in memory; nothing goes into the keychain |
+| Windows | SChannel (TLS 1.2) | Client keys are imported into your CNG key store for the session and deleted when dtop exits |
+
+### Docker contexts
+
+With no `--host` and no `DOCKER_HOST`, dtop uses the active Docker context, including its TLS
+material. `--context prod` picks one explicitly, and `--all-contexts` monitors every context (plus
+`default`). Contexts with `ssh://` endpoints are skipped with a notice.
+
+### Several hosts
+
+```bash
+dtop --host local=unix:///var/run/docker.sock --host prod=tcp://prod.example.com:2376 --tlsverify
+```
+
+- Every host is polled; the header shows a chip per host with its status (● connected,
+  ○ connecting, ✕ offline). Click a chip, press `[`/`]`, or press `H` for a list with each host's
+  containers, CPU, memory and endpoint.
+- Lists, graphs, details, logs and management actions apply to the host on screen. Compose
+  commands get that host's `--context`, or `--host` plus TLS flags.
+- GPU usage is measured on this machine, so it is shown for the first local host.
+- TLS flags on the command line apply to every TCP host. Per-host settings go in `dtop.conf`
+  (below).
+
+![Two hosts: live logs streamed from a TLS daemon](docs/screenshots/hosts-logs.png)
 
 ## Keys
 
@@ -113,6 +188,8 @@ you can use it in scripts and CI.
 | `U` / `D` on a project | `docker compose up -d` / `docker compose down` |
 | `X` | prune the current view's resource type |
 | `T` or `F2` | theme menu: edit with live preview, `s` to save, `Esc` to discard |
+| `[` `]` / `H` | previous / next host / host list (with several hosts; `1`–`9` pick from the list) |
+| `f` | follow or pause the log stream (Logs pane) |
 | `t` / `space` / `R` | cycle theme for this session (not saved) / pause updates / refresh now |
 | `?` / `q` `Ctrl-C` | help / quit |
 
@@ -122,7 +199,8 @@ you can use it in scripts and CI.
 | --- | --- |
 | Click a tab, a row, or a details pane label | switch view / select the row / switch pane |
 | Click an already-selected Compose project | fold or unfold it |
-| Wheel over the list / over the details panel | move the selection / scroll the panel (in Logs, wheel-up goes back in time) |
+| Wheel over the list / over the details panel | move the selection / scroll the panel (in Logs, wheel-up goes back in time and pauses following; scrolling to the end resumes) |
+| Click a host chip in the header, or a row of the host list | switch to that host |
 | Click **Yes** / **No** in a confirmation | confirm / cancel |
 | Click anywhere while help is open | close help |
 
@@ -137,7 +215,6 @@ Settings are read from `dtop.conf` in `$XDG_CONFIG_HOME/dtop`, `~/.config/dtop`,
 
 ```ini
 # dtop.conf
-host = unix:///var/run/docker.sock
 interval = 1s
 theme = midnight
 color = auto
@@ -146,7 +223,21 @@ show_stopped = true
 sort = cpu
 history = 600
 gpu = true
+
+# Hosts (optional; the default is DOCKER_HOST, the active context, or the local socket).
+# Global TLS keys apply to every TCP host: tls, tlsverify, tlscacert, tlscert, tlskey, cert_path.
+tlsverify = true
+host = local=unix:///var/run/docker.sock
+context = staging
+all_contexts = false
+
+# One section per host for per-host settings; section keys override the global ones.
+[host prod]
+endpoint = tcp://prod.example.com:2376
+cert_path = /home/me/.docker/prod
 ```
+
+Sections come after the global settings. Hosts on the command line replace the file's hosts.
 
 ## Themes
 
@@ -196,7 +287,7 @@ border_style = rounded
 
 | Module | Responsibility |
 | --- | --- |
-| `DtopCore` | Endpoint resolution; transports (Unix socket and TCP on POSIX, named pipe on Windows); an incremental HTTP/1.1 client; the Docker Engine API client and models; stats math; compose grouping and CLI invocation; process trees; ring buffers; backoff |
+| `DtopCore` | Endpoint and host resolution (Docker CLI rules, contexts); transports (Unix socket and TCP on POSIX, Winsock TCP and named pipe on Windows); TLS on each platform's stack (OpenSSL, Network.framework, SChannel) with PEM/DER key handling; an incremental HTTP/1.1 client; the Docker Engine API client and models; stats math; compose grouping and CLI invocation; process trees; ring buffers; backoff |
 | `DtopUI` | Colors and styles; a screen buffer with wide-character handling; the diffing renderer; layout; widgets (box, table, gauge, braille graph, sparkline); themes; the VT/mouse/paste input parser; raw-mode terminal I/O |
 | `DtopApp` | Pure `AppState` and reducer (input → state + commands); the `ThemeEditor` state machine; views (including the theme menu panel); the `DataRefresher` actor; `ThemeStore` (saving themes and updating `dtop.conf`); configuration; the `--once` report; the `AppController` event loop |
 | `dtop` | `main.swift`, which calls `DtopMain.run` |
@@ -277,14 +368,17 @@ supported yet, — = not applicable.
 | --- | :-: | :-: | :-: | --- |
 | Connect over a Unix socket | ✓ | ✓ | — | unit · real-socket test (macOS/Linux CI) · integration · e2e |
 | Connect over a named pipe (Docker Desktop) | — | — | ✓ | unit (Windows CI) |
-| Connect over plain-HTTP `tcp://` | ✓ | ✓ | ✗ | unit |
-| TLS `tcp://` and `ssh://` endpoints | ✗ | ✗ | ✗ | planned: forward the socket locally for now |
-| Automatic endpoint discovery (`DOCKER_HOST`, well-known sockets) | ✓ | ✓ | ✓ | unit |
+| Connect over plain-HTTP `tcp://` | ✓ | ✓ | ✓ | unit (Winsock connect/failure on Windows CI) · e2e |
+| TLS (`--tlsverify`, `--tls`, `https://`, client certificates) | ✓ ⁶ | ✓ ⁶ | ✓ ⁶ | real handshakes against `openssl s_server` on all three CI runners · `--once` against a `--tlsverify` docker:dind daemon (Linux CI) · e2e |
+| `ssh://` endpoints | ✗ | ✗ | ✗ | forward the socket first (see above) |
+| Endpoint discovery (`DOCKER_HOST`, Docker contexts, well-known sockets) | ✓ | ✓ | ✓ | unit (contexts laid out as the Docker CLI writes them) |
+| Several hosts at once (chips, `[` `]`, host list, `--once` sections) | ✓ | ✓ | ✓ | unit · e2e (local socket + TLS daemon) · CI `--once` with two daemons |
 | Host CPU / memory / network graphs, per-container rates | ✓ | ✓ | ✓ | unit · integration · e2e |
 | Stats math for cgroup v1, cgroup v2 and Windows containers | ✓ | ✓ | ✓ | unit (real payload fixtures) |
 | Compose project tree and roll-up status | ✓ | ✓ | ✓ | unit · e2e |
 | Process tree (`docker top`) | ✓ | ✓ | ✓ | unit · integration · e2e |
 | Logs pane (stdout/stderr, escapes stripped) | ✓ | ✓ | ✓ | unit · integration · e2e |
+| Live log streaming (`logs -f`), follow/pause, reconnect | ✓ | ✓ | ✓ | unit (mock daemon, stream policy) · e2e (local and over TLS) |
 | Container start / stop / restart / pause / kill / remove | ✓ | ✓ | ✓ | unit · integration · e2e |
 | Compose start / stop / restart / pause | ✓ | ✓ | ✓ | unit |
 | Compose `up` / `down` (needs the `docker compose` CLI on `PATH`) | ✓ | ✓ | ✓ | unit (command building) |
@@ -317,12 +411,14 @@ GPU notes:
 4. Per-container attribution only works when dtop runs on the Docker host itself (same PID
    namespace). It does not work when dtop connects to a remote daemon.
 5. None of this has been tested on real GPU hardware yet; this environment has no GPU.
+6. Linux uses OpenSSL (loaded at runtime), macOS Network.framework, Windows SChannel (TLS 1.2).
+   See [ADR 0003](.github/plans/0003-tls-on-platform-stacks.md).
 
 What the verification labels mean:
 
-- **unit**: the 393-test suite, run in CI on all three platforms.
+- **unit**: the 520-test suite, run in CI on all three platforms (TLS tests included, against a real `openssl s_server`).
 - **integration**: tests against a real Docker daemon on the Linux CI runner.
-- **e2e**: the real app driven in a pseudo-terminal against a live daemon: real key and mouse input, with the rendered screen checked cell by cell. So far this has only been run on Linux.
+- **e2e**: the real app driven in a pseudo-terminal against live daemons (including a `--tlsverify` docker:dind daemon for multi-host and TLS log streaming): real key and mouse input, with the rendered screen checked cell by cell. So far this has only been run on Linux.
 
 **Not verified yet:** hands-on use in real macOS and Windows terminals (Terminal.app, iTerm2,
 Windows Terminal), and Windows against a live Docker Desktop. On those platforms the code builds and
@@ -330,8 +426,12 @@ the unit tests pass, but nobody has driven the app interactively there yet.
 
 ### Platform notes
 
-- **Windows**: dtop talks to Docker Desktop over its named pipe and needs a VT-capable console
-  (Windows Terminal, or Windows 10 1809 or newer). `tcp://` endpoints are not supported on
-  Windows yet.
+- **Windows**: dtop talks to Docker Desktop over its named pipe, or to `tcp://` daemons over
+  Winsock, and needs a VT-capable console (Windows Terminal, or Windows 10 1809 or newer). With a
+  TLS client certificate, the key is imported into your CNG key store as `dtop-<uuid>` and
+  deleted when dtop exits. If dtop is killed, list leftovers with
+  `certutil -csp "Microsoft Software Key Storage Provider" -key` and remove them with
+  `certutil -csp "Microsoft Software Key Storage Provider" -delkey dtop-<uuid>`.
+- **Linux**: TLS needs `libssl` 1.1.1 or 3.x (`libssl3`, `openssl-libs`).
 - **macOS**: when `DOCKER_HOST` is unset, dtop finds the Docker Desktop, OrbStack, Colima and
   Rancher Desktop sockets automatically.

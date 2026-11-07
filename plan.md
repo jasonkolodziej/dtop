@@ -67,13 +67,25 @@ dependencies.
 - ⏳ Profiling on hosts with hundreds of containers (stats fan-out is capped at 8 concurrent
   requests)
 
+### Phase 6: Remote and multi-host ✅
+- ✅ TLS for `tcp://`/`https://` the Docker CLI way (`--tlsverify`, `DOCKER_TLS_VERIFY`,
+  `DOCKER_CERT_PATH`, client certificates) on each platform's own stack — OpenSSL (Linux),
+  Network.framework (macOS), SChannel (Windows) — see ADR 0003
+- ✅ Plain `tcp://` on Windows (Winsock)
+- ✅ Docker contexts: the active context, `--context`, `--all-contexts`
+- ✅ Several hosts at once: header chips, `[`/`]`, host list (`H`), `[host NAME]` config sections,
+  `--once` sections
+- ✅ Live log streaming (`logs?follow=1`) with follow/pause and reconnects
+- ✅ Verified with real handshakes against `openssl s_server` on all three OSes, `--once` against
+  a `--tlsverify` docker:dind daemon in CI, and pseudo-terminal e2e runs (two hosts, logs over TLS)
+
 ## Next Up
 - GPU: AMD and Intel on Windows via performance counters (`\GPU Engine(*)\Utilization Percentage`);
   optionally use AMD SMI / NVML directly (loaded at runtime) for richer metrics
-- Follow logs live (`logs?follow=1`) instead of re-fetching the tail each tick
 - `exec` into a container (hand the TTY to `docker exec -it`)
-- TLS for `tcp://` endpoints (`DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`) and TCP on Windows
-- Docker contexts (`docker context` / `~/.docker/config.json` `currentContext`)
+- `ssh://` endpoints (spawn `ssh … docker system dial-stdio` like the Docker CLI)
+- Keep-alive / TLS session resumption for remote hosts (one handshake per request today)
+- An "all hosts" container view with a HOST column
 - Per-container graphs in the details panel; a disk usage view (`/system/df`)
 - Image pull with progress; persisting UI preferences (sort, collapsed projects)
 

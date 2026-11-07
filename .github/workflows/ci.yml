@@ -65,8 +65,6 @@ jobs:
       - name: Test
         env:
           DTOP_REQUIRE_TLS_TESTS: "1"
-          # Temporary: trace SChannel while the Windows TLS data path is being verified.
-          DTOP_TLS_TRACE: ${{ runner.os == 'Windows' && '1' || '' }}
         run: swift test
 
       # macOS gives secondary threads 512 KB stacks while Linux defaults to 8 MB, so a debug
