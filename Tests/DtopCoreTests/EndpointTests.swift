@@ -42,10 +42,10 @@ struct EndpointParsingTests {
         #expect(throws: DockerError.self) { try DockerEndpoint.parse(raw) }
     }
 
-    @Test("reports ssh and https endpoints as unsupported rather than invalid")
-    func unsupported() {
+    @Test("reports ssh endpoints as unsupported rather than invalid; https is TLS")
+    func unsupported() throws {
         #expect(throws: DockerError.unsupportedEndpoint("ssh://user@host")) { try DockerEndpoint.parse("ssh://user@host") }
-        #expect(throws: DockerError.unsupportedEndpoint("https://host:2376")) { try DockerEndpoint.parse("https://host:2376") }
+        #expect(try DockerEndpoint.parse("https://host:2376") == .tcp(host: "host", port: 2376))
     }
 
     @Test("description round-trips through parse")
