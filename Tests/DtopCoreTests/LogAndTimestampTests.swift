@@ -94,7 +94,9 @@ struct TimestampTests {
         ("2024-01-01T00:00:00.5Z", 1_704_067_200.5),
         ("2024-05-01T14:34:56+02:00", 1_714_566_896.0),
         ("2024-05-01T07:04:56-05:30", 1_714_566_896.0),
-        ("2024-05-01 12:34:56Z", 1_714_566_896.0)
+        ("2024-05-01 12:34:56Z", 1_714_566_896.0),
+        ("2024-02-29T00:00:00Z", 1_709_164_800.0),
+        ("2024-12-31T00:00:00Z", 1_735_603_200.0)
     ])
     func instants(text: String, expected: Double) throws {
         let value = try #require(DockerTimestamp.parse(text))
@@ -103,7 +105,9 @@ struct TimestampTests {
 
     @Test("rejects zero time and malformed input", arguments: [
         "0001-01-01T00:00:00Z", "", "2024-05-01", "2024-13-01T00:00:00Z", "2024-05-01T25:00:00Z",
-        "2024-05-01T12:34:56", "2024-05-01T12:34:56Q", "abcd-ef-ghTij:kl:mnZ", "2024-05-01T12:34:56+0200"
+        "2024-05-01T12:34:56", "2024-05-01T12:34:56Q", "abcd-ef-ghTij:kl:mnZ", "2024-05-01T12:34:56+0200",
+        "2024-02-30T00:00:00Z", "2023-02-29T00:00:00Z", "1900-02-29T00:00:00Z", "2024-04-31T00:00:00Z",
+        "2024-05-00T00:00:00Z", "2024-05-32T00:00:00Z"
     ])
     func invalid(text: String) {
         #expect(DockerTimestamp.parse(text) == nil)
@@ -115,5 +119,13 @@ struct TimestampTests {
         #expect(DockerTimestamp.daysFromCivil(year: 1969, month: 12, day: 31) == -1)
         #expect(DockerTimestamp.daysFromCivil(year: 2000, month: 3, day: 1) == 11_017)
         #expect(DockerTimestamp.daysFromCivil(year: 2400, month: 1, day: 1) == 157_054)
+    }
+
+    @Test("month lengths follow the Gregorian leap-year rules")
+    func monthLengths() {
+        #expect((1...12).map { DockerTimestamp.daysInMonth($0, year: 2023) } == [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
+        #expect(DockerTimestamp.daysInMonth(2, year: 2024) == 29)
+        #expect(DockerTimestamp.daysInMonth(2, year: 2000) == 29)
+        #expect(DockerTimestamp.daysInMonth(2, year: 1900) == 28)
     }
 }

@@ -23,7 +23,7 @@ public enum DockerTimestamp {
               let hour = number(11, 2), bytes[13] == 58,
               let minute = number(14, 2), bytes[16] == 58,
               let second = number(17, 2) else { return nil }
-        guard (1...12).contains(month), (1...31).contains(day), hour < 24, minute < 60, second < 61 else {
+        guard (1...12).contains(month), (1...daysInMonth(month, year: year)).contains(day), hour < 24, minute < 60, second < 61 else {
             return nil
         }
         if year <= 1 { return nil }
@@ -57,6 +57,19 @@ public enum DockerTimestamp {
         let days = daysFromCivil(year: year, month: month, day: day)
         let seconds = days * 86_400 + hour * 3600 + minute * 60 + second - offsetSeconds
         return Double(seconds) + fraction
+    }
+
+    /// Days in `month` (1–12) of `year` in the proleptic Gregorian calendar.
+    static func daysInMonth(_ month: Int, year: Int) -> Int {
+        switch month {
+        case 2:
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+            return leap ? 29 : 28
+        case 4, 6, 9, 11:
+            return 30
+        default:
+            return 31
+        }
     }
 
     /// Howard Hinnant's days-from-civil algorithm (proleptic Gregorian calendar).

@@ -2,7 +2,7 @@
 /// initializers short while staying tolerant.
 extension KeyedDecodingContainer {
     func lenient<T: Decodable>(_ key: Key, default defaultValue: T) -> T {
-        (try? decodeIfPresent(T.self, forKey: key)) .flatMap { $0 } ?? defaultValue
+        lenient(key) ?? defaultValue
     }
 
     func lenient<T: Decodable>(_ key: Key) -> T? {
