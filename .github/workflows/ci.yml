@@ -65,6 +65,8 @@ jobs:
       - name: Test
         env:
           DTOP_REQUIRE_TLS_TESTS: "1"
+          # Temporary: trace SChannel while the Windows TLS data path is being verified.
+          DTOP_TLS_TRACE: ${{ runner.os == 'Windows' && '1' || '' }}
         run: swift test
 
       # macOS gives secondary threads 512 KB stacks while Linux defaults to 8 MB, so a debug
@@ -116,6 +118,14 @@ jobs:
           DOCKER_HOST=tcp://localhost:2376 DOCKER_TLS_VERIFY=1 DOCKER_CERT_PATH="$RUNNER_TEMP/dind-certs/client" \
             swift run dtop --once | tee "$RUNNER_TEMP/tls-once.txt"
           grep -q tls-probe "$RUNNER_TEMP/tls-once.txt"
+          # Both daemons at once: the runner's local socket and the TLS daemon.
+          swift run dtop --once --host local=unix:///var/run/docker.sock \
+            --host dind=tcp://localhost:2376 --tlsverify --tlscacert "$RUNNER_TEMP/dind-certs/client/ca.pem" \
+            --tlscert "$RUNNER_TEMP/dind-certs/client/cert.pem" --tlskey "$RUNNER_TEMP/dind-certs/client/key.pem" \
+            | tee "$RUNNER_TEMP/multi-once.txt"
+          grep -q "== local ==" "$RUNNER_TEMP/multi-once.txt"
+          grep -q "== dind ==" "$RUNNER_TEMP/multi-once.txt"
+          grep -q tls-probe "$RUNNER_TEMP/multi-once.txt"
 
   lint-and-validate:
     name: Lint & Validate

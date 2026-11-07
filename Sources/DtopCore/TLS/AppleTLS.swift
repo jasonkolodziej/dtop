@@ -16,6 +16,7 @@ final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
     private let timeoutSeconds: Int
     private let configuration: TLSConfiguration
     private let endpoint: String
+    private let serverName: String
     private let state = ConnectionState()
 
     /// Mutable state shared with Network.framework's callbacks.
@@ -63,6 +64,7 @@ final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
         self.timeoutSeconds = timeoutSeconds
         self.configuration = configuration
         self.endpoint = endpoint
+        self.serverName = serverName
 
         let tls = NWProtocolTLS.Options()
         let security = tls.securityProtocolOptions
@@ -197,7 +199,7 @@ final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
             let code = CFErrorGetCode(trustFailure)
             let reason = (CFErrorCopyDescription(trustFailure) as String?) ?? "error \(code)"
             if code == Int(errSecHostNameMismatch) || reason.lowercased().contains("does not match") {
-                return .tls(TLSSupport.nameMismatchMessage(serverName: configuration.serverName ?? "the host", endpoint: endpoint))
+                return .tls(TLSSupport.nameMismatchMessage(serverName: serverName, endpoint: endpoint))
             }
             return .tls(TLSSupport.untrustedMessage(reason: reason, endpoint: endpoint, configuration: configuration))
         }

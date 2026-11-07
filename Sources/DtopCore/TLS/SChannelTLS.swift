@@ -162,6 +162,7 @@ final class SSPILibrary: @unchecked Sendable {
         case 0x8009_030E: return "no credentials (SEC_E_NO_CREDENTIALS, \(hex))"
         case 0x8009_030D: return "unknown credentials (SEC_E_UNKNOWN_CREDENTIALS, \(hex))"
         case 0x8009_0304: return "internal error (SEC_E_INTERNAL_ERROR, \(hex))"
+        case 0x8009_0027: return "the client key could not be used with the client certificate — do they belong together? (\(hex))"
         default: return "SSPI status \(hex)"
         }
     }
@@ -301,6 +302,8 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
     private let configuration: TLSConfiguration
     private let serverName: String
     private let endpoint: String
+    /// DER certificates from `--tlscacert`, read before connecting so a bad path fails first.
+    private let caCertificates: [[UInt8]]?
     private let lock = NSLock()
     private var hasContext = false
     private var isClosed = false
@@ -317,6 +320,12 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
         self.serverName = serverName
         self.endpoint = endpoint
         do {
+            caCertificates = try configuration.caFile.map { caFile in
+                guard let text = FileManager.default.contents(atPath: caFile).map({ String(decoding: $0, as: UTF8.self) }) else {
+                    throw DockerError.tls("could not read the CA certificate \(caFile)")
+                }
+                return try PEM.certificates(text, file: caFile)
+            }
             credentials = try SChannelCredentials.shared(for: configuration, library: library)
             try handshake()
             if configuration.verifyPeer { try verifyServer() }
@@ -362,6 +371,8 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
             }
             if first { hasContext = true }
             first = false
+            TLSSupport.trace("handshake: \(SSPILibrary.describe(status)) input=\(encrypted.count) "
+                + "token=\(output.length(0)) extra=\(input.type(1) == SSPILibrary.bufferExtra ? input.length(1) : 0)")
             if let token = output.data(0) {
                 let length = output.length(0)
                 if length > 0 {
@@ -406,6 +417,7 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
         header = Int(sizes.uint32(0))
         trailer = Int(sizes.uint32(4))
         maximumMessage = max(1, Int(sizes.uint32(8)))
+        TLSSupport.trace("stream sizes: header=\(header) trailer=\(trailer) max=\(maximumMessage) leftover=\(encrypted.count)")
     }
 
     // MARK: - Server verification
@@ -427,14 +439,11 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
             if let engine { CertFreeCertificateChainEngine(engine) }
             if let rootStore { _ = CertCloseStore(rootStore, 0) }
         }
-        if let caFile = configuration.caFile {
-            guard let text = FileManager.default.contents(atPath: caFile).map({ String(decoding: $0, as: UTF8.self) }) else {
-                throw DockerError.tls("could not read the CA certificate \(caFile)")
-            }
+        if let caFile = configuration.caFile, let caCertificates {
             // CERT_STORE_PROV_MEMORY is the pseudo-pointer (LPCSTR)2.
             rootStore = CertOpenStore(UnsafePointer<CChar>(bitPattern: 2), 0, 0, 0, nil)
             guard let rootStore else { throw DockerError.tls("could not create a certificate store") }
-            for der in try PEM.certificates(text, file: caFile) {
+            for der in caCertificates {
                 let added = der.withUnsafeBufferPointer { bytes in
                     win32Succeeded(CertAddEncodedCertificateToStore(rootStore, DWORD(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING),
                                                                     bytes.baseAddress, DWORD(bytes.count),
@@ -519,6 +528,7 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
                 let status = library.encrypt(context.pointer, 0, buffers.descriptor.pointer, 0)
                 return (status, buffers.length(0) + buffers.length(1) + buffers.length(2))
             }
+            TLSSupport.trace("encrypt: \(chunk) bytes -> \(SSPILibrary.describe(status)) total=\(total)")
             guard status == SSPILibrary.ok else {
                 throw DockerError.io("TLS encryption failed: \(SSPILibrary.describe(status))")
             }
@@ -552,6 +562,8 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
                     }
                     return status
                 }
+                TLSSupport.trace("decrypt: \(SSPILibrary.describe(status)) input=\(encrypted.count) "
+                    + "plaintext=\(plaintext.count) extra=\(extra.count)")
                 switch status {
                 case SSPILibrary.ok:
                     encrypted = extra
@@ -574,6 +586,7 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
                 }
             }
             let bytes = try underlying.read(maxLength: 16 * 1024)
+            TLSSupport.trace("read: \(bytes.count) bytes")
             if bytes.isEmpty { return [] }
             encrypted += bytes
         }

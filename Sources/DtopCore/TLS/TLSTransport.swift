@@ -1,3 +1,12 @@
+import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
 /// TCP + TLS to a Docker daemon (`--tlsverify`, `DOCKER_TLS_VERIFY`, `https://`). The platform's
 /// own TLS stack does the cryptography (ADR 0003):
 ///
@@ -23,6 +32,7 @@ public struct TLSTransport: DockerTransport {
     public var serverName: String { configuration.serverName ?? host }
 
     public func connect() throws -> any DockerConnection {
+        TLSSupport.ignoreBrokenPipes()
         #if canImport(Network)
         return try AppleTLSConnection(host: host, port: port, configuration: configuration, serverName: serverName,
                                       endpoint: endpoint.description, timeoutSeconds: timeoutSeconds)
@@ -61,6 +71,27 @@ extension DockerClient {
 /// Platform-independent pieces of the TLS backends: name checks and error messages that say
 /// what to do next.
 enum TLSSupport {
+    /// A peer that closes while we write (e.g. a daemon rejecting our certificate) must surface
+    /// as an EPIPE error, not kill the process with SIGPIPE. dtop's own sockets already opt out,
+    /// but the platform TLS stacks write on sockets dtop does not configure.
+    static func ignoreBrokenPipes() {
+        _ = ignoredBrokenPipes
+    }
+
+    private static let ignoredBrokenPipes: Void = {
+        #if !os(Windows)
+        signal(SIGPIPE, SIG_IGN)
+        #endif
+    }()
+
+    /// `DTOP_TLS_TRACE=1` logs TLS internals to stderr, for diagnosing handshakes.
+    static let traceEnabled = ProcessInfo.processInfo.environment["DTOP_TLS_TRACE"] == "1"
+
+    static func trace(_ message: @autoclosure () -> String) {
+        guard traceEnabled else { return }
+        FileHandle.standardError.write(Data(("dtop tls: " + message() + "\n").utf8))
+    }
+
     /// Whether `name` is an IPv4 or IPv6 literal (certificates match those against IP SANs).
     static func isIPAddress(_ name: String) -> Bool {
         if name.contains(":") {

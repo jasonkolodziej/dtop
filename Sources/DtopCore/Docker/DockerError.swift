@@ -34,6 +34,10 @@ public enum DockerError: Error, Equatable, Sendable, CustomStringConvertible {
         case .malformedResponse(let reason):
             return "Docker returned a response dtop could not parse: \(reason)"
         case .http(let status, let message):
+            if message.contains("HTTP request to an HTTPS server") {
+                return "Docker API error \(status): \(message) — this daemon expects TLS: add --tlsverify "
+                    + "(with --tlscacert/--tlscert/--tlskey or DOCKER_CERT_PATH), or use https://"
+            }
             return "Docker API error \(status): \(message)"
         case .decoding(let reason):
             return "Could not decode Docker API response: \(reason) — your Docker version may be unsupported"

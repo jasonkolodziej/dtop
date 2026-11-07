@@ -3,6 +3,14 @@ import DtopUI
 
 /// Plain-text snapshot for `dtop --once`: no escape codes, stable column layout, safe to pipe.
 public enum OnceReport {
+    /// One section per host, each headed `== name ==`. A single host renders exactly as before.
+    public static func render(hosts: [(name: String, snapshot: DockerSnapshot)], width: Int = 120) -> String {
+        guard hosts.count > 1 else { return hosts.first.map { render(snapshot: $0.snapshot, width: width) } ?? "" }
+        return hosts.map { host in
+            "== \(host.name) ==\n" + render(snapshot: host.snapshot, width: width)
+        }.joined(separator: "\n")
+    }
+
     public static func render(snapshot: DockerSnapshot, width: Int = 120) -> String {
         var lines: [String] = []
         if case .disconnected(let message, _) = snapshot.connection {

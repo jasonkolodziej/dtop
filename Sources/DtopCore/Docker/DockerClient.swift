@@ -194,6 +194,54 @@ public struct DockerClient: DockerAPI {
         return decoder.feed(response.body) + decoder.finish()
     }
 
+    public func followLogs(id: String, tail: Int) -> AsyncThrowingStream<[LogLine], Error> {
+        let request = makeRequest(.get, "/containers/\(Self.pathSegment(id))/logs", query: [
+            ("follow", "1"), ("stdout", "1"), ("stderr", "1"), ("tail", String(max(0, tail)))
+        ])
+        let http = streamingHTTP
+        return AsyncThrowingStream { continuation in
+            let cancellation = StreamCancellation()
+            continuation.onTermination = { _ in cancellation.cancel() }
+            DispatchQueue.global(qos: .utility).async {
+                var decoder = LogStreamDecoder()
+                var failure: (status: Int, reason: String)?
+                var errorBody: [UInt8] = []
+                do {
+                    try http.stream(
+                        request,
+                        onConnect: { cancellation.attach($0) },
+                        onHead: { head in
+                            if !head.isSuccess { failure = (head.status, head.reason) }
+                        },
+                        onBody: { chunk in
+                            if failure != nil {
+                                errorBody += chunk
+                                return errorBody.count < 64 * 1024
+                            }
+                            let lines = decoder.feed(chunk)
+                            if !lines.isEmpty { continuation.yield(lines) }
+                            return !cancellation.isCancelled
+                        }
+                    )
+                    if let failure {
+                        let head = HTTPResponseHead(status: failure.status, reason: failure.reason, headers: HTTPHeaders())
+                        continuation.finish(throwing: Self.error(from: HTTPResponse(head: head, body: errorBody)))
+                    } else {
+                        let rest = decoder.finish()
+                        if !rest.isEmpty { continuation.yield(rest) }
+                        continuation.finish()
+                    }
+                } catch {
+                    if cancellation.isCancelled {
+                        continuation.finish()
+                    } else {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+        }
+    }
+
     public func perform(_ action: ContainerAction, containerID: String) async throws {
         let request = makeRequest(.post, "/containers/\(Self.pathSegment(containerID))/\(action.verb)", query: action.query)
         // 304 means "already in that state", which is fine for an interactive tool.

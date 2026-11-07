@@ -51,6 +51,27 @@ public struct DockerHost: Sendable, Equatable, Identifiable {
     public var description: String {
         endpoint.description + (tls.map { " (\($0.summary))" } ?? "")
     }
+
+    /// The Docker context this host came from, if any (`default` is not a stored context).
+    public var contextName: String? {
+        guard source.hasPrefix("context ") else { return nil }
+        let name = String(source.dropFirst("context ".count))
+        return name == "default" ? nil : name
+    }
+
+    /// Global `docker` CLI flags that reach this same daemon (used for `docker compose`):
+    /// `--context` for contexts, else `--host` plus the TLS flags.
+    public var dockerCLIArguments: [String] {
+        if let contextName { return ["--context", contextName] }
+        var arguments = ["--host", endpoint.description]
+        if let tls {
+            arguments.append(tls.verifyPeer ? "--tlsverify" : "--tls")
+            if let ca = tls.caFile { arguments += ["--tlscacert", ca] }
+            if let certificate = tls.certificateFile { arguments += ["--tlscert", certificate] }
+            if let key = tls.keyFile { arguments += ["--tlskey", key] }
+        }
+        return arguments
+    }
 }
 
 /// TLS-related settings as the user gave them (flags, config file). Unset fields fall back to

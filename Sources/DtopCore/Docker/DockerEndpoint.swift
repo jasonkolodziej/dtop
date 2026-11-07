@@ -34,6 +34,15 @@ public enum DockerEndpoint: Equatable, Sendable, CustomStringConvertible {
         }
     }
 
+    /// Whether the daemon runs on this machine (sockets, pipes, loopback TCP), so that things
+    /// measured here — like GPU usage — belong to it.
+    public var isLocal: Bool {
+        switch self {
+        case .unixSocket, .namedPipe: return true
+        case .tcp(let host, _): return ["localhost", "127.0.0.1", "::1"].contains(host.lowercased())
+        }
+    }
+
     /// The host name or address of a TCP endpoint (nil for local transports).
     public var tcpHost: String? {
         if case .tcp(let host, _) = self { return host }

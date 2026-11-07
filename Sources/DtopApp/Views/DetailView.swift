@@ -57,10 +57,16 @@ enum DetailView {
             hits.append(PaneHit(pane: pane, rect: Rect(x: x, y: inner.y, width: width, height: 1)))
             x += width + 1
         }
+        let detail = context.snapshot.detail?.containerID == container.id ? context.snapshot.detail : nil
+        if context.state.detailPane == .logs, let (text, role) = logStatus(detail, state: context.state) {
+            let width = TextWidth.of(text)
+            if inner.maxX - width > x {
+                buffer.write(text, x: inner.maxX - width, y: inner.y, style: theme.style(role))
+            }
+        }
         let content = inner.inset(top: 1)
         guard !content.isEmpty else { return hits }
 
-        let detail = context.snapshot.detail?.containerID == container.id ? context.snapshot.detail : nil
         if let error = detail?.error {
             buffer.write(TextWidth.truncate(error, to: content.width), x: content.x, y: content.y,
                          style: theme.style(.error))
@@ -182,16 +188,44 @@ enum DetailView {
         }
     }
 
+    /// The stream indicator next to the pane tabs: live, paused (scrolled back) or ended.
+    static func logStatus(_ detail: ContainerDetailData?, state: AppState) -> (String, ThemeRole)? {
+        guard let detail else { return nil }
+        switch detail.logState {
+        case .idle:
+            return nil
+        case .live:
+            return state.logFollow ? ("● live ", .success) : ("⏸ paused · f follow ", .warning)
+        case .ended(nil):
+            return ("■ ended ", .muted)
+        case .ended(.some):
+            return ("✕ stream lost ", .error)
+        }
+    }
+
     static func drawLogs(into buffer: inout ScreenBuffer, rect: Rect, detail: ContainerDetailData?, context: RenderContext) {
         let theme = context.theme
         guard let detail else {
             buffer.write("Loading logs…", x: rect.x, y: rect.y, style: theme.style(.muted))
             return
         }
+        if case .ended(let error?) = detail.logState {
+            // Keep what was received, and say why it stopped on the last line.
+            let note = "log stream lost: \(error) — reconnecting if the container is running"
+            buffer.write(TextWidth.truncate(note, to: rect.width), x: rect.x, y: rect.maxY - 1, style: theme.style(.error))
+            return drawLogLines(into: &buffer, rect: rect.inset(bottom: 1), detail: detail, context: context)
+        }
         guard !detail.logs.isEmpty else {
-            buffer.write("No log output", x: rect.x, y: rect.y, style: theme.style(.muted))
+            let message = detail.logState == .live ? "Waiting for log output…" : "No log output"
+            buffer.write(message, x: rect.x, y: rect.y, style: theme.style(.muted))
             return
         }
+        drawLogLines(into: &buffer, rect: rect, detail: detail, context: context)
+    }
+
+    static func drawLogLines(into buffer: inout ScreenBuffer, rect: Rect, detail: ContainerDetailData, context: RenderContext) {
+        let theme = context.theme
+        guard rect.height > 0 else { return }
         // Newest at the bottom; scrolling moves back in time.
         let scroll = min(context.state.detailScroll, max(0, detail.logs.count - rect.height))
         let end = detail.logs.count - scroll

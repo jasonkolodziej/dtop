@@ -6,11 +6,13 @@ enum OverlayView {
         ("Navigate", [
             ("↑↓ j k", "move selection"), ("PgUp PgDn", "page"), ("g G Home End", "first / last"),
             ("← → Tab h l", "switch view"), ("1-5", "jump to view"), ("mouse", "click, wheel"),
-            ("Enter", "details / fold project"), ("v", "cycle detail pane"), ("d", "toggle details")
+            ("Enter", "details / fold project"), ("v", "cycle detail pane"), ("d", "toggle details"),
+            ("[ ]", "previous / next host"), ("H", "host list")
         ]),
         ("View", [
             ("/", "filter (Esc clears)"), ("s / S", "sort key / direction"), ("a", "all · running · stopped"),
             ("T F2", "theme menu (live, save/revert)"), ("t", "cycle theme (not saved)"),
+            ("f", "follow / pause the log stream"),
             ("space", "pause updates"), ("R F5", "refresh now")
         ]),
         ("Manage", [
@@ -18,6 +20,57 @@ enum OverlayView {
             ("D", "remove / compose down"), ("U", "compose up"), ("X", "prune this view"), ("q Ctrl-C", "quit")
         ])
     ]
+
+    /// The host list: every monitored host with its status and load. Returns row hits.
+    static func drawHostPicker(into buffer: inout ScreenBuffer, selected: Int, context: RenderContext) -> [HostHit] {
+        let theme = context.theme
+        let hosts = context.hosts
+        guard !hosts.isEmpty else { return [] }
+        let width = min(buffer.width - 4, 96)
+        let height = min(buffer.height - 2, hosts.count + 5)
+        guard width > 20, height > 4 else { return [] }
+        let rect = buffer.bounds.centered(width: width, height: height)
+        let dialog = Style(foreground: theme[.foreground], background: theme[.dialogBackground])
+        buffer.fill(rect, style: dialog)
+        let inner = Box.draw(into: &buffer, rect: rect, title: "hosts (\(hosts.count))", label: "⏎ switch · esc close",
+                             borderStyle: dialog.foreground(theme[.dialogBorder]),
+                             titleStyle: dialog.foreground(theme[.title]).bold, characters: theme.border)
+        let columns = [
+            TableColumn("", width: .fixed(2)),
+            TableColumn("HOST", width: .flexible(min: 10, weight: 1)),
+            TableColumn("STATUS", width: .fixed(10)),
+            TableColumn("UP", width: .fixed(7), alignment: .right),
+            TableColumn("CPU%", width: .fixed(6), alignment: .right, priority: 2),
+            TableColumn("MEM", width: .fixed(8), alignment: .right, priority: 3),
+            TableColumn("ENDPOINT", width: .flexible(min: 12, weight: 2), priority: 1)
+        ]
+        let rows: [[TableCell]] = hosts.enumerated().map { index, host in
+            let status: (String, ThemeRole)
+            switch host.connection {
+            case .connected: status = ("connected", .statusRunning)
+            case .connecting: status = ("connecting", .warning)
+            case .disconnected: status = ("offline", .error)
+            }
+            return [
+                TableCell(index < 9 ? String(index + 1) : "", style: theme.style(.muted)),
+                TableCell((index == context.state.activeHost ? "▸ " : "  ") + host.name, style: theme.style(.title)),
+                TableCell(HeaderView.connectionSymbol(host.connection) + " " + status.0, style: theme.style(status.1)),
+                TableCell(host.total > 0 || host.connection.isConnected ? "\(host.running)/\(host.total)" : "-"),
+                TableCell(host.cpuPercent.map { Format.percent($0, decimals: 1) } ?? "-"),
+                TableCell(host.memoryUsed.map { Format.compactBytes(Double($0)) } ?? "-"),
+                TableCell(host.description, style: theme.style(.muted))
+            ]
+        }
+        let styles = TableStyles(header: dialog.foreground(theme[.tableHeader]).bold, row: dialog,
+                                 selected: theme.selection.adding(.bold), scrollIndicator: theme.style(.muted))
+        let layout = Table.draw(into: &buffer, rect: inner, columns: columns, rows: rows, selected: selected,
+                                scrollOffset: 0, styles: styles)
+        if case .disconnected(let message, _) = hosts[min(selected, hosts.count - 1)].connection, inner.height > hosts.count + 2 {
+            buffer.write(message, x: inner.x + 1, y: inner.maxY - 1, style: dialog.foreground(theme[.error]),
+                         maxWidth: inner.width - 2)
+        }
+        return layout.rowRects.map { HostHit(index: $0.index, rect: $0.rect) }
+    }
 
     static func drawHelp(into buffer: inout ScreenBuffer, context: RenderContext) {
         let theme = context.theme

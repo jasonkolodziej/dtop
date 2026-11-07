@@ -6,7 +6,8 @@ public actor DataRefresher {
     public let api: any DockerAPI
     public let commandRunner: any CommandRunning
     public let gpuCollector: (any GPUCollecting)?
-    public let endpoint: DockerEndpoint?
+    /// The host, when compose commands must name it explicitly (nil: the docker CLI's default).
+    public let host: DockerHost?
     public private(set) var snapshot: DockerSnapshot
     private var sampler = StatsSampler()
     private var backoff: Backoff
@@ -18,7 +19,7 @@ public actor DataRefresher {
     public init(
         api: any DockerAPI,
         endpointDescription: String,
-        endpoint: DockerEndpoint? = nil,
+        host: DockerHost? = nil,
         commandRunner: any CommandRunning = ProcessCommandRunner(),
         gpuCollector: (any GPUCollecting)? = nil,
         historySize: Int = 240,
@@ -29,7 +30,7 @@ public actor DataRefresher {
         random: @escaping @Sendable () -> Double = { Double.random(in: 0..<1) }
     ) {
         self.api = api
-        self.endpoint = endpoint
+        self.host = host
         self.commandRunner = commandRunner
         self.gpuCollector = gpuCollector
         self.snapshot = DockerSnapshot(endpoint: endpointDescription, metrics: MetricsStore(capacity: historySize))
@@ -229,7 +230,7 @@ public actor DataRefresher {
             }
             return "compose \(operation.rawValue) \(projectName): \(targets.count) container(s)"
         }
-        let invocation = ComposeCommandBuilder.invocation(for: operation, project: project, endpoint: endpoint)
+        let invocation = ComposeCommandBuilder.invocation(for: operation, project: project, host: host)
         let result = try await commandRunner.run(invocation)
         guard result.succeeded else {
             let lastLine = result.output.split(separator: "\n").last.map(String.init) ?? "exit code \(result.exitCode)"
