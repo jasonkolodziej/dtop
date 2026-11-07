@@ -179,8 +179,8 @@ struct NvidiaSMITests {
         #expect(devices[0].device.id == "nvidia:GPU-11111111-2222-3333-4444-555555555555")
         #expect(devices[0].device.name == "NVIDIA GeForce RTX 3080")
         #expect(devices[0].device.utilization == 45)
-        #expect(devices[0].device.memoryUsed == 3210 * 1_048_576)
-        #expect(devices[0].device.memoryTotal == 10240 * 1_048_576)
+        #expect(devices[0].device.memoryUsed == UInt64(3210 * 1_048_576))
+        #expect(devices[0].device.memoryTotal == UInt64(10240 * 1_048_576))
         #expect(devices[0].device.temperature == 61)
         #expect(devices[1].device.utilization == nil, "[N/A] becomes nil, not 0")
         #expect(devices[1].device.temperature == nil)
@@ -197,7 +197,7 @@ struct NvidiaSMITests {
         let apps = NvidiaSMI.parseComputeApps(GPUFixtures.nvidiaApps)
         #expect(apps.count == 2)
         #expect(apps[0].pid == 4242)
-        #expect(apps[0].memoryBytes == 1536 * 1_048_576)
+        #expect(apps[0].memoryBytes == UInt64(1536 * 1_048_576))
         #expect(apps[1].memoryBytes == nil)
     }
 
@@ -244,17 +244,17 @@ struct DRMFdinfoTests {
         #expect(client.cycles["rcs"] == 28_257_900)
         #expect(client.totalCycles["rcs"] == 7_655_183_225)
         #expect(client.engineCapacity["vcs"] == 2)
-        #expect(client.residentMemory["vram0"] == 23992 * 1024)
-        #expect(client.residentMemory["gtt"] == 192 * 1024)
-        #expect(client.deviceMemory == 23992 * 1024, "only device-local regions count as GPU memory")
+        #expect(client.residentMemory["vram0"] == UInt64(23992 * 1024))
+        #expect(client.residentMemory["gtt"] == UInt64(192 * 1024))
+        #expect(client.deviceMemory == UInt64(23992 * 1024), "only device-local regions count as GPU memory")
         #expect(client.engineNanoseconds.isEmpty)
     }
 
     @Test("amdgpu's legacy drm-memory-* keys alias resident memory")
     func amdgpuLegacy() throws {
         let client = try #require(DRMClient.parse(GPUFixtures.amdgpuFdinfo(gfxNanoseconds: 5_000)))
-        #expect(client.residentMemory["vram"] == 2048 * 1024)
-        #expect(client.deviceMemory == 2048 * 1024)
+        #expect(client.residentMemory["vram"] == UInt64(2048 * 1024))
+        #expect(client.deviceMemory == UInt64(2048 * 1024))
         #expect(client.engineNanoseconds["gfx"] == 5_000)
         let both = try #require(DRMClient.parse("drm-driver: amdgpu\ndrm-client-id: 1\ndrm-resident-vram: 1 MiB\ndrm-memory-vram: 9 MiB\n"))
         #expect(both.residentMemory["vram"] == 1_048_576, "the standard key wins over the deprecated alias")
@@ -265,7 +265,7 @@ struct DRMFdinfoTests {
         #expect(DRMClient.parse("drm-driver: amdgpu\n") == nil)
         #expect(DRMClient.parse("drm-client-id: 3\n") == nil)
         #expect(DRMClient.parse("") == nil)
-        #expect(DRMClient.parseBytes("7 GiB") == 7 * 1_073_741_824)
+        #expect(DRMClient.parseBytes("7 GiB") == UInt64(7 * 1_073_741_824))
         #expect(DRMClient.parseBytes("12") == 12)
         #expect(DRMClient.parseBytes("x KiB") == nil)
     }
@@ -470,7 +470,7 @@ struct SystemGPUCollectorTests {
         #expect(sample.processes.map(\.pid) == [4242, 5151, 7777])
         let train = sample.processes[0]
         #expect(train.utilization == 40)
-        #expect(train.memoryBytes == 1536 * 1_048_576)
+        #expect(train.memoryBytes == UInt64(1536 * 1_048_576))
         #expect(train.containerID == GPUFixtures.containerA)
         #expect(sample.processes[1].containerID == GPUFixtures.containerB)
         #expect(sample.processes[2].containerID == nil, "host processes stay unattributed")
@@ -525,7 +525,7 @@ struct SystemGPUCollectorTests {
         #expect(first.devices == [GPUDevice(id: "drm:0000:03:00.0", vendor: .amd, name: "Radeon RX 7900 XT",
                                             utilization: 63, memoryUsed: 1_073_741_824, memoryTotal: 8_589_934_592)])
         #expect(first.processes.first?.utilization == nil, "no baseline yet")
-        #expect(first.processes.first?.memoryBytes == 2048 * 1024)
+        #expect(first.processes.first?.memoryBytes == UInt64(2048 * 1024))
         #expect(first.processes.first?.containerID == GPUFixtures.containerA)
 
         fs.set("/proc/300/fdinfo/5", GPUFixtures.amdgpuFdinfo(gfxNanoseconds: 750_000_000))
