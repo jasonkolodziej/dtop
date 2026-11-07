@@ -8,8 +8,9 @@ enum HeaderView {
         buffer.fill(rect, style: base)
         let snapshot = context.snapshot
 
-        var x = rect.x
-        x += buffer.write(" dtop ", x: x, y: rect.y, style: base.foreground(theme[.accent]).bold)
+        var x = rect.x + 1
+        x += BrandMark.drawCompact(into: &buffer, x: x, y: rect.y, base: base, theme: theme, maxWidth: rect.maxX - x)
+        x += buffer.write(" dtop ", x: x, y: rect.y, style: base.foreground(theme[.title]).bold, maxWidth: max(0, rect.maxX - x))
         var facts: [String] = []
         if let version = snapshot.version {
             facts.append("docker \(version.version)")

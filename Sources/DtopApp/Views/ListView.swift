@@ -64,7 +64,20 @@ enum ListView {
                 }
             }
         }
-        let top = rect.y + max(0, (rect.height - lines.count) / 2)
+        // Before dtop has reached Docker, show the logo above the status when there is room for it.
+        var splash = false
+        if case .connected = context.snapshot.connection {} else { splash = true }
+        let splashHeight = BrandMark.large.count + 3 // mark, blank line, name and version, blank line
+        splash = splash && rect.height >= lines.count + splashHeight + 2 && rect.width >= BrandMark.largeWidth + 4
+        var top = rect.y + max(0, (rect.height - lines.count - (splash ? splashHeight : 0)) / 2)
+        if splash {
+            BrandMark.drawLarge(into: &buffer, x: rect.x + (rect.width - BrandMark.largeWidth) / 2, y: top,
+                                bounds: rect, base: theme.base, theme: theme)
+            let name = "dtop \(AppProfile.current.version)"
+            buffer.write(name, x: rect.x + max(0, (rect.width - TextWidth.of(name)) / 2), y: top + BrandMark.large.count + 1,
+                         style: theme.style(.title).bold, maxWidth: rect.width)
+            top += splashHeight
+        }
         for (offset, line) in lines.enumerated() where top + offset < rect.maxY {
             let text = TextWidth.truncate(line, to: rect.width)
             let x = rect.x + max(0, (rect.width - TextWidth.of(text)) / 2)
