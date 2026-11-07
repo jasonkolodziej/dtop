@@ -71,6 +71,9 @@ dependencies.
 - Image pull with progress; persisting UI preferences (sort, collapsed projects)
 
 ## Architecture
+Design decisions: [ADR 0001](.github/plans/0001-zero-dependency-cross-platform-architecture.md).
+Per-platform support and how each feature was verified: the feature matrix in `README.md`.
+
 - `Sources/DtopCore`: Docker transports, HTTP, API client, models, metrics, compose
 - `Sources/DtopUI`: rendering primitives, widgets, themes, input, terminal
 - `Sources/DtopApp`: state and reducer, views, runtime (refresher and controller), configuration

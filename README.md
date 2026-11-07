@@ -98,6 +98,20 @@ you can use it in scripts and CI.
 | `t` / `space` / `R` | cycle theme for this session (not saved) / pause updates / refresh now |
 | `?` / `q` `Ctrl-C` | help / quit |
 
+**Mouse** (on by default; `--no-mouse` turns it off):
+
+| Action | Effect |
+| --- | --- |
+| Click a tab, a row, or a details pane label | switch view / select the row / switch pane |
+| Click an already-selected Compose project | fold or unfold it |
+| Wheel over the list / over the details panel | move the selection / scroll the panel (in Logs, wheel-up goes back in time) |
+| Click **Yes** / **No** in a confirmation | confirm / cancel |
+| Click anywhere while help is open | close help |
+
+Press `?` inside dtop for the same reference:
+
+![The help overlay listing key bindings](docs/screenshots/help.png)
+
 ## Configuration
 
 Settings are read from `dtop.conf` in `$XDG_CONFIG_HOME/dtop`, `~/.config/dtop`, or
@@ -165,11 +179,13 @@ border_style = rounded
 | --- | --- |
 | `DtopCore` | Endpoint resolution; transports (Unix socket and TCP on POSIX, named pipe on Windows); an incremental HTTP/1.1 client; the Docker Engine API client and models; stats math; compose grouping and CLI invocation; process trees; ring buffers; backoff |
 | `DtopUI` | Colors and styles; a screen buffer with wide-character handling; the diffing renderer; layout; widgets (box, table, gauge, braille graph, sparkline); themes; the VT/mouse/paste input parser; raw-mode terminal I/O |
-| `DtopApp` | Pure `AppState` and reducer (input → state + commands); views; the `DataRefresher` actor; configuration; the `--once` report; the `AppController` event loop |
+| `DtopApp` | Pure `AppState` and reducer (input → state + commands); the `ThemeEditor` state machine; views (including the theme menu panel); the `DataRefresher` actor; `ThemeStore` (saving themes and updating `dtop.conf`); configuration; the `--once` report; the `AppController` event loop |
 | `dtop` | `main.swift`, which calls `DtopMain.run` |
 
 Views and the reducer are pure functions of state, so they are tested without a terminal or a
-daemon. The `DockerAPI` protocol lets the runtime be tested against a fake.
+daemon. The `DockerAPI` protocol lets the runtime be tested against a fake, and theme saving
+takes injected file operations. The main design decisions are recorded in
+[`.github/plans/0001-zero-dependency-cross-platform-architecture.md`](.github/plans/0001-zero-dependency-cross-platform-architecture.md).
 
 ## Development
 
@@ -190,14 +206,61 @@ swift run dtop
 ```
 
 `swift test` runs the full unit suite and needs no Docker daemon. The integration suite needs a
-reachable daemon. It creates labelled `alpine` containers and removes them afterwards. CI builds
-and tests on Linux, macOS and Windows, and runs the integration suite and `dtop --once` against
-the Docker daemon on the Linux runner.
+reachable daemon. It creates labelled `alpine` containers and removes them afterwards.
 
-## Platform notes
+CI runs on every PR and push to `main`:
+
+- **Linux, macOS, Windows**: build, unit tests, and smoke tests of the executable.
+- **Linux only**:
+  - The unit tests again with 512 KB thread stacks. macOS gives secondary threads 512 KB, so this catches debug-build stack overflows that Linux's 8 MB default would hide.
+  - The integration suite and `dtop --once`, against the runner's Docker daemon.
+
+To regenerate the screenshots in `docs/screenshots/`, see
+[`scripts/screenshots/README.md`](scripts/screenshots/README.md).
+
+## Feature matrix
+
+What works on each platform, and how it has been verified so far. ✓ = supported, ✗ = not
+supported yet, — = not applicable.
+
+| Feature | macOS | Linux | Windows | Verified by |
+| --- | :-: | :-: | :-: | --- |
+| Connect over a Unix socket | ✓ | ✓ | — | unit · real-socket test (macOS/Linux CI) · integration · e2e |
+| Connect over a named pipe (Docker Desktop) | — | — | ✓ | unit (Windows CI) |
+| Connect over plain-HTTP `tcp://` | ✓ | ✓ | ✗ | unit |
+| TLS `tcp://` and `ssh://` endpoints | ✗ | ✗ | ✗ | planned: forward the socket locally for now |
+| Automatic endpoint discovery (`DOCKER_HOST`, well-known sockets) | ✓ | ✓ | ✓ | unit |
+| Host CPU / memory / network graphs, per-container rates | ✓ | ✓ | ✓ | unit · integration · e2e |
+| Stats math for cgroup v1, cgroup v2 and Windows containers | ✓ | ✓ | ✓ | unit (real payload fixtures) |
+| Compose project tree and roll-up status | ✓ | ✓ | ✓ | unit · e2e |
+| Process tree (`docker top`) | ✓ | ✓ | ✓ | unit · integration · e2e |
+| Logs pane (stdout/stderr, escapes stripped) | ✓ | ✓ | ✓ | unit · integration · e2e |
+| Container start / stop / restart / pause / kill / remove | ✓ | ✓ | ✓ | unit · integration · e2e |
+| Compose start / stop / restart / pause | ✓ | ✓ | ✓ | unit |
+| Compose `up` / `down` (needs the `docker compose` CLI on `PATH`) | ✓ | ✓ | ✓ | unit (command building) |
+| Images / networks / volumes: list, remove, prune | ✓ | ✓ | ✓ | unit · integration (listing) |
+| Filter, sort, running/stopped filter | ✓ | ✓ | ✓ | unit · e2e |
+| Mouse (SGR reporting, split reports over SSH) | ✓ | ✓ | ✓ | unit · e2e |
+| 10 themes, theme menu with live preview, save/revert | ✓ | ✓ | ✓ | unit · e2e |
+| Truecolor → 256 → 16-color fallback, `NO_COLOR` | ✓ | ✓ | ✓ | unit |
+| Config file location | `~/.config/dtop` | `$XDG_CONFIG_HOME/dtop` or `~/.config/dtop` | `%APPDATA%\dtop` | unit |
+| `dtop --once` plain-text report | ✓ | ✓ | ✓ | CI against a real daemon (Linux) |
+| Reconnect with backoff when the daemon goes away | ✓ | ✓ | ✓ | unit |
+
+What the verification labels mean:
+
+- **unit**: the 393-test suite, run in CI on all three platforms.
+- **integration**: tests against a real Docker daemon on the Linux CI runner.
+- **e2e**: the real app driven in a pseudo-terminal against a live daemon: real key and mouse input, with the rendered screen checked cell by cell. So far this has only been run on Linux.
+
+**Not verified yet:** hands-on use in real macOS and Windows terminals (Terminal.app, iTerm2,
+Windows Terminal), and Windows against a live Docker Desktop. On those platforms the code builds and
+the unit tests pass, but nobody has driven the app interactively there yet.
+
+### Platform notes
 
 - **Windows**: dtop talks to Docker Desktop over its named pipe and needs a VT-capable console
   (Windows Terminal, or Windows 10 1809 or newer). `tcp://` endpoints are not supported on
   Windows yet.
-- **macOS**: when `DOCKER_HOST` is unset, dtop finds the Docker Desktop, OrbStack and Colima
-  sockets automatically.
+- **macOS**: when `DOCKER_HOST` is unset, dtop finds the Docker Desktop, OrbStack, Colima and
+  Rancher Desktop sockets automatically.

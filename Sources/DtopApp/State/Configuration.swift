@@ -151,7 +151,7 @@ public struct AppConfiguration: Sendable, Equatable {
       -v, --version             Show version
 
     KEYS (press ? inside dtop for the full list):
-      ↑/↓ j/k move · ←/→ Tab switch views · / filter · s sort · Enter details · q quit
+      ↑/↓ j/k move · ←/→ Tab switch views · / filter · s sort · Enter details · T themes · q quit
     """
 
     /// Pre-scans for `--config` so the file can be applied before other flags override it.
