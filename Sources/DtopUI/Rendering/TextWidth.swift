@@ -123,9 +123,12 @@ public enum TextWidth {
                         line = ""
                         lineWidth = 0
                     } else {
+                        // Hard-break a word longer than the line; the piece becomes the current
+                        // line so a final fragment is not followed by a spurious empty line.
                         let head = prefix(remaining, width: width)
                         let safeHead = head.isEmpty ? String(remaining.prefix(1)) : head
-                        lines.append(safeHead)
+                        line = safeHead
+                        lineWidth = max(width, of(safeHead))
                         remaining = String(remaining.dropFirst(safeHead.count))
                     }
                 }

@@ -62,8 +62,11 @@ public enum ProcessTree {
             }
             let command: String
             if let commandColumn, commandColumn < row.count {
-                // `ps` may split a command containing spaces across trailing cells.
-                command = row[commandColumn...].joined(separator: " ")
+                // `ps` may split a command containing spaces across extra trailing cells, but only
+                // when the command is the last column (Windows lists the image name first).
+                command = commandColumn == titles.count - 1
+                    ? row[commandColumn...].joined(separator: " ")
+                    : row[commandColumn]
             } else {
                 command = row.last ?? ""
             }

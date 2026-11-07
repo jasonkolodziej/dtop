@@ -77,7 +77,10 @@ public struct ScreenBuffer: Sendable, Equatable {
     @discardableResult
     public mutating func write(_ text: String, x: Int, y: Int, style: Style = .plain, maxWidth: Int? = nil, clip: Rect? = nil) -> Int {
         var column = x
-        let limit = maxWidth.map { x + max(0, $0) } ?? Int.max
+        // Stop at the requested width or the visible edge, whichever comes first, so the
+        // returned width is what actually landed on screen.
+        let area = clip.map { $0.intersection(bounds) } ?? bounds
+        let limit = min(maxWidth.map { x + max(0, $0) } ?? Int.max, max(x, area.maxX))
         for character in text {
             let characterWidth = TextWidth.of(character)
             if characterWidth == 0 { continue }
