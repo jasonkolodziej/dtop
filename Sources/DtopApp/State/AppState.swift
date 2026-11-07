@@ -144,7 +144,7 @@ public struct AppState: Sendable, Equatable {
 
     public init(configuration: AppConfiguration) {
         sortKey = configuration.sortKey
-        sortDescending = configuration.sortDescending
+        sortDescending = configuration.sortDescending ?? configuration.sortKey.prefersDescending
         statusFilter = configuration.showStopped ? .all : .running
         themeName = configuration.themeName
     }

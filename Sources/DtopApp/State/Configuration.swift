@@ -29,7 +29,8 @@ public struct AppConfiguration: Sendable, Equatable {
     public var mouse = true
     public var showStopped = true
     public var sortKey: SortKey = .cpu
-    public var sortDescending = true
+    /// nil means "the natural direction for the sort key" (biggest consumers first for cpu/memory).
+    public var sortDescending: Bool?
     public var historySize = 240
     public var configFilePath: String?
     public var mode: RunMode = .interactive

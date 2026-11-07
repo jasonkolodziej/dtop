@@ -36,10 +36,28 @@ public struct InputParser: Sendable {
         return events
     }
 
-    /// Resolves whatever is pending as plain keys: a lone ESC becomes `.escape`, a dangling
-    /// `ESC x` becomes Alt+x, and an unterminated paste is delivered as-is.
+    /// True while a CSI/SS3 sequence (e.g. a mouse report) or a bracketed paste has started but
+    /// not finished. Such input deserves a longer wait than a lone ESC: over SSH a report can
+    /// arrive in two reads, and resolving it early would turn its tail into keystrokes.
+    public var hasIncompleteSequence: Bool {
+        if pasteBuffer != nil { return true }
+        guard buffer.count >= 2, buffer[0] == Self.escapeByte else { return false }
+        return buffer[1] == UInt8(ascii: "[") || buffer[1] == UInt8(ascii: "O")
+    }
+
+    /// Suggested wait before calling `flush()` for the current pending input.
+    public var flushDelay: Double { hasIncompleteSequence ? 0.5 : 0.03 }
+
+    /// Resolves whatever is pending: a lone ESC becomes `.escape`, a dangling `ESC x` becomes
+    /// Alt+x, and an unterminated paste is delivered as-is. An unfinished CSI/SS3 sequence longer
+    /// than its introducer is dropped — never re-read as keys — because its parameter bytes
+    /// (digits, `;`, `M`) would otherwise trigger commands.
     public mutating func flush() -> [InputEvent] {
         var events: [InputEvent] = []
+        if pasteBuffer == nil, buffer.count > 2, hasIncompleteSequence {
+            buffer.removeAll()
+            return events
+        }
         if let paste = pasteBuffer {
             events.append(.paste(String(decoding: paste + buffer, as: UTF8.self)))
             pasteBuffer = nil

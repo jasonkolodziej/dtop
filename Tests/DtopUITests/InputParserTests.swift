@@ -141,6 +141,42 @@ struct InputParserBufferingTests {
         #expect(parser.flush().isEmpty)
     }
 
+    @Test("a mouse report split across reads completes normally")
+    func splitMouseReport() {
+        var parser = InputParser()
+        #expect(parser.feed(Array("\u{1B}[<0;".utf8)).isEmpty)
+        #expect(parser.hasIncompleteSequence)
+        #expect(parser.flushDelay > 0.2, "half a sequence gets a longer grace period than a lone ESC")
+        #expect(parser.feed(Array("3;16M".utf8)) == [.mouse(MouseEvent(button: .left, action: .press, x: 2, y: 15))])
+        #expect(!parser.hasIncompleteSequence)
+    }
+
+    @Test("an abandoned half sequence is dropped on flush, never re-read as keystrokes")
+    func abandonedSequence() {
+        var parser = InputParser()
+        _ = parser.feed(Array("\u{1B}[<0;3;1".utf8))
+        #expect(parser.flush().isEmpty, "digits like 3 and 1 would otherwise switch tabs")
+        #expect(!parser.hasPendingInput)
+        #expect(parser.feed(Array("6Mq".utf8)) == [
+            .key(KeyEvent(.character("6"))), .key(KeyEvent(.character("M"))), .key(KeyEvent(.character("q")))
+        ], "bytes after the drop are ordinary input")
+
+        _ = parser.feed(Array("\u{1B}O".utf8))
+        #expect(parser.hasIncompleteSequence)
+        #expect(parser.flush() == [.key(KeyEvent(.character("O"), modifiers: .alt))], "a bare introducer is still Alt+key")
+    }
+
+    @Test("a lone ESC keeps the short timeout")
+    func loneEscapeDelay() {
+        var parser = InputParser()
+        _ = parser.feed([0x1B])
+        #expect(!parser.hasIncompleteSequence)
+        #expect(parser.flushDelay < 0.1)
+        var paste = InputParser()
+        _ = paste.feed(Array("\u{1B}[200~partial".utf8))
+        #expect(paste.hasIncompleteSequence, "an unfinished paste waits longer too")
+    }
+
     @Test("an overlong unterminated CSI is discarded so input cannot stall")
     func overlongCSI() {
         var parser = InputParser()

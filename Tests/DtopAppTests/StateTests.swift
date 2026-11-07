@@ -644,6 +644,26 @@ struct ReducerMouseTests {
         #expect(state.detailScroll == 0, "never negative")
     }
 
+    @Test("in the logs pane wheel-up scrolls back in time, wheel-down returns to the newest lines")
+    func wheelLogs() {
+        var state = AppState()
+        state.detailPane = .logs
+        _ = state.handle(click(45, 5, button: .wheelUp), snapshot: snapshot, hitMap: hitMap(), now: 0)
+        #expect(state.detailScroll == 3)
+        _ = state.handle(click(45, 5, button: .wheelUp), snapshot: snapshot, hitMap: hitMap(), now: 0)
+        #expect(state.detailScroll == 6)
+        _ = state.handle(click(45, 5, button: .wheelDown), snapshot: snapshot, hitMap: hitMap(), now: 0)
+        #expect(state.detailScroll == 3)
+        _ = state.handle(click(45, 5, button: .wheelDown), snapshot: snapshot, hitMap: hitMap(), now: 0)
+        _ = state.handle(click(45, 5, button: .wheelDown), snapshot: snapshot, hitMap: hitMap(), now: 0)
+        #expect(state.detailScroll == 0, "never scrolls past the newest line")
+
+        // Non-container rows show key/value details, which scroll top-down even with the logs pane set.
+        state.tab = .images
+        _ = state.handle(click(45, 5, button: .wheelDown), snapshot: snapshot, hitMap: hitMap(), now: 0)
+        #expect(state.detailScroll == 3)
+    }
+
     @Test("focus events are ignored")
     func focus() {
         var state = AppState()

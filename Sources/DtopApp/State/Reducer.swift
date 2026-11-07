@@ -258,7 +258,10 @@ extension AppState {
         case .wheelUp, .wheelDown:
             let delta = mouse.button == .wheelUp ? -1 : 1
             if hitMap.detailRect.contains(x: mouse.x, y: mouse.y) {
-                detailScroll = max(0, detailScroll + delta * 3)
+                // The logs pane is anchored to the newest line and scrolls back in time, so the
+                // wheel moves the other way there (wheel up = older lines).
+                let showsLogs = detailPane == .logs && selected(items)?.container != nil
+                detailScroll = max(0, detailScroll + (showsLogs ? -delta : delta) * 3)
             } else {
                 moveSelection(by: delta, items: items)
             }

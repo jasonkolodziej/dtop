@@ -202,11 +202,13 @@ public final class AppController {
             inputGeneration += 1
             for inputEvent in parser.feed(bytes) { apply(inputEvent, now: now) }
             if parser.hasPendingInput {
-                // Give the rest of an escape sequence a moment to arrive before treating ESC as a key.
+                // Give the rest of an escape sequence a moment to arrive before treating ESC as a
+                // key; half-received sequences (mouse reports, pastes) get a longer grace period.
                 let generation = inputGeneration
                 let continuation = self.continuation
+                let delay = UInt64(parser.flushDelay * 1_000_000_000)
                 tasks.append(Task.detached {
-                    try? await Task.sleep(nanoseconds: 30_000_000)
+                    try? await Task.sleep(nanoseconds: delay)
                     continuation.yield(.flushInput(generation: generation))
                 })
             }

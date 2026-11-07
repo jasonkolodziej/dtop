@@ -122,8 +122,23 @@ struct ConfigFileTests {
         #expect(!configuration.mouse)
         #expect(!configuration.showStopped)
         #expect(configuration.sortKey == .name)
-        #expect(!configuration.sortDescending)
+        #expect(configuration.sortDescending == false)
         #expect(configuration.historySize == 600)
+    }
+
+    @Test("sort direction follows the key unless set explicitly")
+    func sortDirection() throws {
+        var byName = AppConfiguration()
+        try byName.apply(arguments: ["--sort", "name"])
+        #expect(byName.sortDescending == nil)
+        #expect(!AppState(configuration: byName).sortDescending, "names sort A→Z")
+        var byMemory = AppConfiguration()
+        try byMemory.apply(arguments: ["--sort", "memory"])
+        #expect(AppState(configuration: byMemory).sortDescending, "biggest consumers first")
+        #expect(AppState(configuration: AppConfiguration()).sortDescending, "default cpu sort is descending")
+        var explicit = AppConfiguration()
+        try explicit.apply(configFile: "sort_descending = true\nsort = name")
+        #expect(AppState(configuration: explicit).sortDescending, "an explicit direction wins regardless of order")
     }
 
     @Test("command-line flags override the file")
