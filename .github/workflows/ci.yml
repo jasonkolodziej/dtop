@@ -56,6 +56,12 @@ jobs:
       - name: Test
         run: swift test
 
+      # macOS gives secondary threads 512 KB stacks while Linux defaults to 8 MB, so a debug
+      # build with an oversized stack frame only crashes on macOS. Catch that on Linux too.
+      - name: Test with macOS-sized thread stacks (512 KB)
+        if: runner.os == 'Linux'
+        run: bash -c 'ulimit -s 512 && .build/debug/dtopPackageTests.xctest --testing-library swift-testing'
+
       # GitHub's Linux runners have a Docker daemon, so exercise the real Engine API there.
       - name: Integration tests (real Docker daemon)
         if: runner.os == 'Linux'

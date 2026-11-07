@@ -117,7 +117,9 @@ public enum InputMode: Sendable, Equatable {
     case filter
     case help
     case confirm(Confirmation)
-    case themeEditor(ThemeEditor)
+    // Boxed: the editor carries several full themes, and keeping it inline made every AppState
+    // copy ~600 bytes, which overflowed 512 KB secondary-thread stacks on macOS in debug builds.
+    indirect case themeEditor(ThemeEditor)
 }
 
 /// All UI state. Pure value type: the reducer mutates it, views read it.

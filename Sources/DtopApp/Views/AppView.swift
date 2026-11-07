@@ -67,8 +67,14 @@ public struct ScreenLayout: Sendable, Equatable {
 public enum AppView {
     public static func render(_ context: RenderContext) -> RenderedFrame {
         // While the theme menu is open, everything renders with its draft so edits show live.
-        var context = context
-        if let editor = context.state.themeEditor { context.theme = editor.draft }
+        guard case .themeEditor(let editor) = context.state.mode else { return renderBody(context) }
+        return renderBody(RenderContext(state: context.state, snapshot: context.snapshot, theme: editor.draft,
+                                        size: context.size, clock: context.clock, now: context.now))
+    }
+
+    // Kept separate from `render` so debug builds don't reserve stack for several copies of the
+    // large context (that pushed the frame to ~800 KB and overflowed 512 KB macOS thread stacks).
+    private static func renderBody(_ context: RenderContext) -> RenderedFrame {
         let theme = context.theme
         var buffer = ScreenBuffer(
             width: context.size.columns,
