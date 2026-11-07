@@ -1,4 +1,11 @@
-# dtop
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/dtop-logo-dark.svg">
+    <img src="docs/brand/dtop-logo-light.svg" alt="dtop" width="340">
+  </picture>
+</h1>
+
+<p align="center"><strong>The modern terminal dashboard for containers.</strong></p>
 
 `dtop` is a Swift terminal UI inspired by `btop`/`htop`, built around Docker and Docker Compose:
 live resource graphs, a compose-aware container tree, per-container processes and logs, and
@@ -199,6 +206,36 @@ daemon. The `DockerAPI` protocol lets the runtime be tested against a fake, and 
 takes injected file operations. The main design decisions are recorded in
 [`.github/plans/0001-zero-dependency-cross-platform-architecture.md`](.github/plans/0001-zero-dependency-cross-platform-architecture.md).
 
+## Branding
+
+<img src="docs/brand/dtop-icon.svg" alt="dtop icon" width="96" align="right">
+
+The dtop mark is a terminal prompt beside three rising metric bars, on a rounded dark tile. The
+files are in [`docs/brand/`](docs/brand/):
+
+| File | Use |
+| --- | --- |
+| `dtop-icon.svg` | The icon, for any size |
+| `dtop-icon-{1024,512,256,128,64,32}.png` | The icon as PNGs with transparent corners (avatars, app stores, social cards) |
+| `dtop-logo-dark.svg` | Icon and wordmark for dark backgrounds |
+| `dtop-logo-light.svg` | Icon and wordmark for light backgrounds |
+
+| Color | Hex | In the mark |
+| --- | --- | --- |
+| Accent blue | `#4fa3e8` | Prompt chevron and baseline |
+| Green | `#4fd18b` | Short bar |
+| Purple | `#b58af0` | Middle bar |
+| Pink | `#f0679a` | Tall bar |
+| Tile | `#111823`, border `#2a3a52` | Background tile |
+| Ink / paper | `#0a0e14` / `#f2f6fb` | Wordmark on light / dark backgrounds |
+
+The wordmark is JetBrains Mono ExtraBold (SIL Open Font License), converted to outlines so the
+SVGs need no font. In the terminal, dtop draws the mark itself: `> ▃▅▇` in the header, and a
+larger block-character version while it connects to Docker or waits to reconnect. It uses the
+active theme's accent, success, memory and gpu colors, so the mark follows your theme.
+`scripts/brand/build.py` regenerates every file in `docs/brand/` (`--png` also renders the PNGs
+with Playwright).
+
 ## Development
 
 ```bash
@@ -228,7 +265,8 @@ CI runs on every PR and push to `main`:
   - The integration suite and `dtop --once`, against the runner's Docker daemon.
 
 To regenerate the screenshots in `docs/screenshots/`, see
-[`scripts/screenshots/README.md`](scripts/screenshots/README.md).
+[`scripts/screenshots/README.md`](scripts/screenshots/README.md). To regenerate the logo and icon
+files in `docs/brand/`, run `python3 scripts/brand/build.py --png`.
 
 ## Feature matrix
 
