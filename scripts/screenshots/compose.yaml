@@ -1,0 +1,18 @@
+services:
+  web:
+    image: nginx:alpine
+    ports: ["8080:80"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost"]
+      interval: 5s
+  api:
+    image: alpine:3.20
+    command: ["sh", "-c", "while true; do timeout 4 sh -c 'while :; do :; done'; sleep 3; done"]
+  client:
+    image: alpine:3.20
+    command: ["sh", "-c", "while true; do wget -q -O /dev/null http://web/ 2>/dev/null; echo GET / 200; sleep 0.02; done"]
+  worker:
+    image: alpine:3.20
+    command: ["sh", "-c", "i=0; while true; do i=`expr $$i + 1`; echo job $$i done; sleep 1; done"]
+    deploy:
+      replicas: 2

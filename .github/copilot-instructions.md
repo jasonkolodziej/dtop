@@ -4,7 +4,31 @@ This file provides repository-wide custom instructions for GitHub Copilot across
 
 ## Repository Purpose
 
-This is a **GitHub repository template** designed to provide a consistent, best-practice starting point for new projects. It includes Copilot configuration, CI/CD workflows, VS Code workspace settings, and reusable agent skills/prompts.
+This repository is **dtop**, a Swift terminal UI (in the spirit of `btop`/`htop`) for monitoring and managing Docker and Docker Compose. It runs on macOS, Linux and Windows. `README.md` covers features, keys, configuration and a per-platform feature matrix. `plan.md` covers status and next steps. `.github/plans/` holds architecture decisions.
+
+## Project Conventions (dtop)
+
+- **Zero third-party dependencies.** Use Foundation and the platform C libraries only (`Darwin`, `Glibc`/`Musl`, `WinSDK`/`ucrt`). Don't add Swift packages.
+- **Module layout**:
+  - `DtopCore`: Docker transports, HTTP client, API client and models, metrics math, GPU collectors.
+  - `DtopUI`: rendering, widgets, themes, input parsing, terminal I/O.
+  - `DtopApp`: state, reducer, views and runtime.
+  - `dtop`: a one-line `main.swift`.
+  - Keep that layering: `DtopUI` must not import `DtopCore`.
+- **Pure core, thin runtime.**
+  - `AppState.handle(_:)`, `ThemeEditor` and the views are pure functions of their inputs.
+  - Side effects (Docker calls, file writes) go through `AppCommand`, which `AppController`/`DataRefresher` execute.
+  - Docker access goes through the `DockerAPI` protocol so it can be faked in tests.
+- **Cross-platform code**:
+  - Guard platform APIs with `#if os(Windows)` / `#if canImport(Darwin)` / `#if canImport(Glibc)`.
+  - Call libc functions through the specific module (`Darwin.read`, `Glibc.connect`), not `Foundation.`.
+  - Win32 `BOOL` imports as `Bool` from Swift 6.2 and as `WindowsBool` before that; use the `win32Succeeded(_:)` helper.
+- **Stack size**: macOS secondary threads get 512 KB of stack. Avoid functions that copy large state structs many times in debug builds (CI runs the Linux tests with `ulimit -s 512` to catch this).
+- **Swift 6 language mode** with strict concurrency. Prefer `Sendable` value types. Use `@unchecked Sendable` only with real internal locking.
+- **Build and test**:
+  - `swift build`
+  - `swift test`: unit tests, no daemon needed.
+  - `DTOP_INTEGRATION=1 swift test --filter Integration`: needs a real daemon.
 
 ## Coding Guidelines
 
@@ -24,7 +48,7 @@ This is a **GitHub repository template** designed to provide a consistent, best-
 
 ## Testing Guidelines
 
-- Write tests alongside feature code (co-located or in a `tests/` directory).
+- Write tests alongside feature code in the matching `Tests/<Module>Tests` target, using Swift Testing (`import Testing`, `@Test`, `#expect`).
 - Aim for meaningful test coverage of public APIs and critical paths.
 - Tests should be deterministic and independent of each other.
 - Use descriptive test names that explain the expected behavior.

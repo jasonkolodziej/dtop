@@ -5,34 +5,91 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  lint-and-validate:
-    name: Lint & Validate
-    runs-on: ubuntu-24.04
-
-    permissions:
-      contents: read
+  build-and-test:
+    name: Build & test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: macOS
+            os: macos-15
+          - name: Windows
+            os: windows-2022
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Swift
+      - name: Set up Swift (Linux)
+        if: runner.os == 'Linux'
         uses: swift-actions/setup-swift@v2
         with:
           swift-version: "6.0"
 
-      # ---------------------------------------------------------------
-      # Add language-specific lint, build, and test steps below.
-      # The steps below are general-purpose checks suitable for any repo.
-      # ---------------------------------------------------------------
+      # Swift 6.0.x cannot build the `ucrt` module against the Windows 11 SDK (10.0.26100)
+      # that the runner image ships, so Windows uses a newer toolchain. The package still
+      # declares swift-tools-version 6.0.
+      - name: Set up Swift (Windows)
+        if: runner.os == 'Windows'
+        # Pinned to the commit of compnerd/gha-setup-swift `main` this workflow was validated with
+        # (2026-11-07); bump deliberately.
+        uses: compnerd/gha-setup-swift@57fe462cd3c7b05ae8fcff79b00719312e305257
+        with:
+          branch: swift-6.2-release
+          tag: 6.2-RELEASE
 
-      - name: Build Swift package
+      # macOS runners ship Xcode 16+, whose toolchain already speaks Swift 6.
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Build
         run: swift build
 
-      - name: Test Swift package
+      - name: Test
         run: swift test
+
+      # macOS gives secondary threads 512 KB stacks while Linux defaults to 8 MB, so a debug
+      # build with an oversized stack frame only crashes on macOS. Catch that on Linux too.
+      - name: Test with macOS-sized thread stacks (512 KB)
+        if: runner.os == 'Linux'
+        run: bash -c 'ulimit -s 512 && .build/debug/dtopPackageTests.xctest --testing-library swift-testing'
+
+      # GitHub's Linux runners have a Docker daemon, so exercise the real Engine API there.
+      - name: Integration tests (real Docker daemon)
+        if: runner.os == 'Linux'
+        env:
+          DTOP_INTEGRATION: "1"
+        run: swift test --filter Integration
+
+      - name: Smoke test the executable
+        shell: bash
+        run: |
+          swift run dtop --version
+          swift run dtop --help > /dev/null
+          swift run dtop --list-themes
+
+      - name: Smoke test --once against Docker (Linux)
+        if: runner.os == 'Linux'
+        run: swift run dtop --once
+
+  lint-and-validate:
+    name: Lint & Validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Install YAML validator dependency
         run: python3 -m pip install --disable-pip-version-check --user pyyaml
@@ -64,3 +121,11 @@ jobs:
             exit 1
           fi
           echo "No secret patterns found."
+
+      - name: Check Swift sources for trailing whitespace
+        run: |
+          if grep -rnE "[[:space:]]+$" --include="*.swift" Sources Tests; then
+            echo "Trailing whitespace found (see lines above)."
+            exit 1
+          fi
+          echo "No trailing whitespace."
