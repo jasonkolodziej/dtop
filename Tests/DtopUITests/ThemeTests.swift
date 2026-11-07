@@ -105,6 +105,22 @@ struct ThemeFileTests {
         }
     }
 
+    @Test("the README's hand-written theme example parses")
+    func readmeExample() throws {
+        let text = """
+        name = mine
+        inherits = harbor
+        accent = #4fb0f5
+        status_running = green
+        # border styles: rounded, single, double, heavy, ascii
+        border_style = rounded
+        """
+        let theme = try ThemeFile.parse(text, fallbackName: "x")
+        #expect(theme.name == "mine")
+        #expect(theme[.statusRunning] == .ansi(2))
+        #expect(theme.border == .rounded)
+    }
+
     @Test("error descriptions include line numbers")
     func errorDescription() {
         #expect(ThemeParseError(line: 3, message: "bad").description == "theme line 3: bad")

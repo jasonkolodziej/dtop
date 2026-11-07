@@ -12,8 +12,9 @@ public enum DtopMain {
                                                                homeDirectory: home)
 
         var configuration = AppConfiguration()
+        var explicitConfig: String?
         do {
-            let explicitConfig = try AppConfiguration.configPathArgument(arguments)
+            explicitConfig = try AppConfiguration.configPathArgument(arguments)
             let defaultConfig = configDirectory.map { joinPath([$0, "dtop.conf"], platform: platform) }
             if let path = explicitConfig ?? defaultConfig {
                 if let text = readTextFile(path) {
@@ -103,7 +104,8 @@ public enum DtopMain {
             colorMode: configuration.colorMode ?? ColorMode.detect(environment: environment),
             themeLoader: themeLoader,
             themeNames: themeLoader.availableNames(listDirectory: listDirectory),
-            readFile: readTextFile
+            readFile: readTextFile,
+            themeStore: ThemeStore(configDirectory: configDirectory, configFile: explicitConfig, platform: platform)
         )
         do {
             try await controller.run()

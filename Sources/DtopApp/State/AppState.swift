@@ -1,4 +1,5 @@
 import DtopCore
+import DtopUI
 
 public enum Tab: Int, Sendable, CaseIterable, Hashable {
     case containers
@@ -116,6 +117,7 @@ public enum InputMode: Sendable, Equatable {
     case filter
     case help
     case confirm(Confirmation)
+    case themeEditor(ThemeEditor)
 }
 
 /// All UI state. Pure value type: the reducer mutates it, views read it.
@@ -151,6 +153,31 @@ public struct AppState: Sendable, Equatable {
 
     public mutating func post(_ text: String, level: NoticeLevel, now: Double, duration: Double? = 4) {
         notice = Notice(text: text, level: level, expiresAt: duration.map { now + $0 })
+    }
+
+    /// The editor, when the theme menu is open.
+    public var themeEditor: ThemeEditor? {
+        if case .themeEditor(let editor) = mode { return editor }
+        return nil
+    }
+
+    public mutating func openThemeEditor(current: Theme, available: [Theme]) {
+        mode = .themeEditor(ThemeEditor(current: current, available: available))
+    }
+
+    /// Called by the runtime after trying to persist a theme. Success closes the editor and makes
+    /// the theme current; failure keeps the editor (and the unsaved draft) open with the reason.
+    public mutating func finishThemeSave(name: String, error: String?, location: String?, now: Double) {
+        guard case .themeEditor(var editor) = mode else { return }
+        if let error {
+            editor.field = .none
+            editor.message = error
+            mode = .themeEditor(editor)
+            return
+        }
+        themeName = name
+        mode = .normal
+        post("Saved theme '\(name)'" + (location.map { " to \($0)" } ?? ""), level: .success, now: now, duration: 6)
     }
 
     public mutating func expireNotice(now: Double) {

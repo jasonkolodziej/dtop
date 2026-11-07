@@ -33,8 +33,10 @@ public final class AppController {
     private let refresher: DataRefresher
     private let api: any DockerAPI
     private let themeLoader: ThemeLoader
-    private let themeNames: [String]
+    private var themeNames: [String]
     private let readFile: @Sendable (String) -> String?
+    private let themeStore: ThemeStore
+    private let fileSystem: ThemeFileSystem
 
     private var state: AppState
     private var snapshot: DockerSnapshot
@@ -70,8 +72,12 @@ public final class AppController {
         colorMode: ColorMode,
         themeLoader: ThemeLoader,
         themeNames: [String],
-        readFile: @escaping @Sendable (String) -> String?
+        readFile: @escaping @Sendable (String) -> String?,
+        themeStore: ThemeStore,
+        fileSystem: ThemeFileSystem = .local
     ) {
+        self.themeStore = themeStore
+        self.fileSystem = fileSystem
         self.configuration = configuration
         self.terminal = terminal
         self.api = api
@@ -292,6 +298,20 @@ public final class AppController {
                 let result = await refresher.perform(operation)
                 continuation.yield(.operationFinished(result))
             })
+        case .openThemeEditor:
+            // Custom themes that fail to parse are skipped here; `t` reports their errors.
+            var themes = themeNames.compactMap { try? themeLoader.load($0, readFile: readFile) }
+            if themes.isEmpty { themes = Theme.builtIn }
+            state.openThemeEditor(current: theme, available: themes)
+        case .saveTheme(let name, let saved):
+            do {
+                let result = try themeStore.save(saved, name: name, fileSystem: fileSystem)
+                theme = saved
+                if !themeNames.contains(name) { themeNames.append(name) }
+                state.finishThemeSave(name: name, error: nil, location: result.themeFile ?? result.configFile, now: now())
+            } catch {
+                state.finishThemeSave(name: name, error: String(describing: error), location: nil, now: now())
+            }
         case .themeChanged(let name):
             do {
                 theme = try themeLoader.load(name, readFile: readFile)

@@ -10,7 +10,8 @@ enum OverlayView {
         ]),
         ("View", [
             ("/", "filter (Esc clears)"), ("s / S", "sort key / direction"), ("a", "all · running · stopped"),
-            ("t", "cycle theme"), ("space", "pause updates"), ("R F5", "refresh now")
+            ("T F2", "theme menu (live, save/revert)"), ("t", "cycle theme (not saved)"),
+            ("space", "pause updates"), ("R F5", "refresh now")
         ]),
         ("Manage", [
             ("u", "start / unpause"), ("x", "stop"), ("r", "restart"), ("p", "pause / unpause"), ("K", "kill"),

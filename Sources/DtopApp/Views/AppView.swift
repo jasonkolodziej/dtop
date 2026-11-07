@@ -66,6 +66,9 @@ public struct ScreenLayout: Sendable, Equatable {
 
 public enum AppView {
     public static func render(_ context: RenderContext) -> RenderedFrame {
+        // While the theme menu is open, everything renders with its draft so edits show live.
+        var context = context
+        if let editor = context.state.themeEditor { context.theme = editor.draft }
         let theme = context.theme
         var buffer = ScreenBuffer(
             width: context.size.columns,
@@ -110,6 +113,8 @@ public enum AppView {
             let buttons = OverlayView.drawConfirmation(into: &buffer, confirmation: confirmation, context: context)
             hitMap.confirmButton = buttons.confirm
             hitMap.cancelButton = buttons.cancel
+        case .themeEditor(let editor):
+            hitMap.editorRows = ThemeEditorView.draw(into: &buffer, editor: editor)
         default:
             break
         }

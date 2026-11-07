@@ -7,6 +7,9 @@ public enum AppCommand: Sendable, Equatable {
     case refresh(inventory: Bool)
     case perform(DockerOperation)
     case themeChanged(String)
+    /// Open the theme menu; the runtime supplies the current and available themes.
+    case openThemeEditor
+    case saveTheme(name: String, theme: Theme)
 }
 
 public struct TabHit: Sendable, Equatable {
@@ -33,6 +36,7 @@ public struct HitMap: Sendable, Equatable {
     public var listScrollOffset = 0
     public var detailRect: Rect = .zero
     public var detailPanes: [PaneHit] = []
+    public var editorRows: [RowHit] = []
     public var confirmButton: Rect?
     public var cancelButton: Rect?
 
@@ -56,6 +60,18 @@ extension AppState {
             return handleFilter(event)
         case .confirm(let confirmation):
             return handleConfirm(event, confirmation: confirmation, hitMap: hitMap)
+        case .themeEditor(var editor):
+            switch editor.handle(event, rowHits: hitMap.editorRows) {
+            case .editing:
+                mode = .themeEditor(editor)
+            case .cancelled:
+                mode = .normal
+                if editor.isDirty { post("Theme changes discarded", level: .info, now: now, duration: 3) }
+            case .save(let name, let theme):
+                mode = .themeEditor(editor)
+                return [.saveTheme(name: name, theme: theme)]
+            }
+            return []
         case .normal:
             switch event {
             case .key(let key):
@@ -89,6 +105,7 @@ extension AppState {
         case .tab, .right: switchTab(tab.next())
         case .backTab, .left: switchTab(tab.previous())
         case .function(1): mode = .help
+        case .function(2): return [.openThemeEditor]
         case .function(5): return [.refresh(inventory: true)]
         case .escape:
             if !filterText.isEmpty {
@@ -153,6 +170,8 @@ extension AppState {
             themeName = themeNames[index]
             post("Theme: \(themeName)", level: .info, now: now, duration: 2)
             return [.themeChanged(themeName)]
+        case "T":
+            return [.openThemeEditor]
         case " ":
             isPaused.toggle()
             post(isPaused ? "Updates paused — press space to resume" : "Updates resumed", level: .info, now: now,

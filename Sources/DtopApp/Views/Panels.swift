@@ -169,12 +169,12 @@ enum FooterView {
         switch context.state.tab {
         case .containers:
             return common + [("s", "sort"), ("a", "show"), ("u", "start"), ("x", "stop"), ("r", "restart"),
-                             ("p", "pause"), ("K", "kill"), ("D", "remove"), ("v", "pane"), ("t", "theme")]
+                             ("p", "pause"), ("K", "kill"), ("D", "remove"), ("v", "pane"), ("T", "themes")]
         case .compose:
             return common + [("⏎", "fold"), ("u", "start"), ("U", "up"), ("x", "stop"), ("r", "restart"),
-                             ("D", "down"), ("v", "pane"), ("t", "theme")]
+                             ("D", "down"), ("v", "pane"), ("T", "themes")]
         case .images, .networks, .volumes:
-            return common + [("D", "remove"), ("X", "prune"), ("d", "details"), ("t", "theme")]
+            return common + [("D", "remove"), ("X", "prune"), ("d", "details"), ("T", "themes")]
         }
     }
 
@@ -182,6 +182,12 @@ enum FooterView {
         let theme = context.theme
         let base = Style(foreground: theme[.headerForeground], background: theme[.headerBackground])
         buffer.fill(rect, style: base)
+
+        if context.state.themeEditor != nil {
+            let hint = " theme menu · changes preview live · s saves to dtop.conf · esc discards"
+            buffer.write(hint, x: rect.x, y: rect.y, style: base.foreground(theme[.accent]), maxWidth: rect.width)
+            return
+        }
 
         if context.state.mode == .filter {
             var x = rect.x + 1
