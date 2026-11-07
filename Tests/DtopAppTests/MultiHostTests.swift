@@ -421,3 +421,38 @@ struct LogStreamPolicyTests {
         #expect(LogStreamPolicy.decide(current: nil, wanted: running, state: .ended("reset"), reconnectPending: true, isReconnect: true) == .start)
     }
 }
+
+@Suite("Pausing and the log stream")
+struct PauseLogTests {
+    @Test("resuming updates while following jumps back to the newest log line")
+    func resume() {
+        var state = AppState()
+        state.selectedIDs[.containers] = "id-web-1"
+        state.detailPane = .logs
+        _ = state.handle(.key(KeyEvent(.character(" "))), snapshot: AppFixtures.snapshot(), hitMap: HitMap(), now: 0)
+        #expect(state.isPaused)
+        state.detailScroll = 40 // lines that arrived while paused, held off screen
+        _ = state.handle(.key(KeyEvent(.character(" "))), snapshot: AppFixtures.snapshot(), hitMap: HitMap(), now: 0)
+        #expect(!state.isPaused)
+        #expect(state.detailScroll == 0)
+        state.logFollow = false
+        state.detailScroll = 12
+        _ = state.handle(.key(KeyEvent(.character(" "))), snapshot: AppFixtures.snapshot(), hitMap: HitMap(), now: 0)
+        _ = state.handle(.key(KeyEvent(.character(" "))), snapshot: AppFixtures.snapshot(), hitMap: HitMap(), now: 0)
+        #expect(state.detailScroll == 12, "a scrolled-back view stays where the user put it")
+    }
+
+    @Test("the logs pane says when updates are paused")
+    func indicator() {
+        var state = AppState()
+        state.selectedIDs[.containers] = "id-web-1"
+        state.detailPane = .logs
+        state.isPaused = true
+        var snapshot = AppFixtures.snapshot()
+        snapshot.detail = ContainerDetailData(containerID: "id-web-1", logs: [LogLine(stream: .stdout, text: "x")])
+        snapshot.detail?.logState = .live
+        let text = AppView.render(RenderContext(state: state, snapshot: snapshot, theme: .harbor,
+                                                size: TerminalSize(columns: 150, rows: 40), now: 0)).buffer.plainText
+        #expect(text.contains("⏸ updates paused"))
+    }
+}

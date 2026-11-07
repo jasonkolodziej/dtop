@@ -84,6 +84,8 @@ public final class AppController {
     private var logStream: (host: Int, containerID: String, task: Task<Void, Never>)?
     private var logRestartAt: Double?
     private let logTail: Int
+    /// Lines that arrived while updates were paused (space); added when updates resume.
+    private var pausedLogLines: [LogLine] = []
 
     private let events: AsyncStream<LoopEvent>
     private let continuation: AsyncStream<LoopEvent>.Continuation
@@ -340,12 +342,16 @@ public final class AppController {
             loadDetailIfNeeded(force: true)
         case .logLines(let host, let containerID, let lines):
             guard let stream = logStream, stream.host == host, stream.containerID == containerID, host == active,
-                  var detail = snapshot.detail, detail.containerID == containerID else { return }
-            detail.appendLogs(lines)
-            detail.logState = .live
-            snapshot.detail = detail
-            // Scrolled back: keep the same lines on screen while new ones arrive below.
-            if !state.logFollow { state.detailScroll += lines.count }
+                  snapshot.detail?.containerID == containerID else { return }
+            if state.isPaused {
+                // Paused: the screen stays frozen; keep the lines for when updates resume.
+                pausedLogLines += lines
+                if pausedLogLines.count > ContainerDetailData.maximumLogLines {
+                    pausedLogLines.removeFirst(pausedLogLines.count - ContainerDetailData.maximumLogLines)
+                }
+                return
+            }
+            appendStreamedLogs(lines)
         case .logStreamEnded(let host, let containerID, let error):
             guard let stream = logStream, stream.host == host, stream.containerID == containerID else { return }
             logStream = nil
@@ -360,6 +366,15 @@ public final class AppController {
         }
     }
 
+    /// Adds streamed lines to the detail pane. When scrolled back, the same lines stay on screen.
+    private func appendStreamedLogs(_ lines: [LogLine]) {
+        guard var detail = snapshot.detail, !lines.isEmpty else { return }
+        detail.appendLogs(lines)
+        detail.logState = .live
+        snapshot.detail = detail
+        if !state.logFollow { state.detailScroll += lines.count }
+    }
+
     private func apply(_ event: InputEvent, now: Double) {
         let previousSelection = ListModel.selectedItem(snapshot: snapshot, state: state)?.id
         let previousPane = state.detailPane
@@ -372,6 +387,11 @@ public final class AppController {
             loadDetailIfNeeded(force: false)
         }
         updateLogStream(restart: false)
+        if !state.isPaused && !pausedLogLines.isEmpty {
+            let lines = pausedLogLines
+            pausedLogLines.removeAll()
+            appendStreamedLogs(lines)
+        }
     }
 
     private func execute(_ command: AppCommand) {
@@ -499,6 +519,7 @@ public final class AppController {
         }
         guard let wanted else { return }
 
+        pausedLogLines.removeAll()
         var detail = existing ?? ContainerDetailData(containerID: wanted.containerID)
         detail.logs = []
         detail.logState = .live

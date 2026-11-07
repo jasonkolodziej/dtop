@@ -199,6 +199,8 @@ extension AppState {
             return [.openThemeEditor]
         case " ":
             isPaused.toggle()
+            // Resuming while following the log stream jumps back to the newest line.
+            if !isPaused && logFollow && detailPane == .logs { detailScroll = 0 }
             post(isPaused ? "Updates paused — press space to resume" : "Updates resumed", level: .info, now: now,
                  duration: isPaused ? nil : 2)
         case "R":

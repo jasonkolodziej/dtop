@@ -44,6 +44,7 @@ rendering.
 - **Live logs**: the Logs pane follows the selected container's output as it is written
   (`logs -f`), with terminal escapes stripped and stderr highlighted. It keeps the last 5,000
   lines and holds your place when you scroll back; `f` (or scrolling to the end) resumes.
+  Pausing updates (space) freezes the pane too; lines that arrive meanwhile appear on resume.
 - **Remote and TLS daemons**: `tcp://` and `https://` endpoints with TLS configured the way the
   Docker CLI does it (`--tlsverify`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`, client
   certificates), plus Docker contexts. TLS uses each OS's own stack, so there are still no
@@ -416,7 +417,7 @@ GPU notes:
 
 What the verification labels mean:
 
-- **unit**: the 520-test suite, run in CI on all three platforms (TLS tests included, against a real `openssl s_server`).
+- **unit**: the 522-test suite, run in CI on all three platforms (TLS tests included, against a real `openssl s_server`).
 - **integration**: tests against a real Docker daemon on the Linux CI runner.
 - **e2e**: the real app driven in a pseudo-terminal against live daemons (including a `--tlsverify` docker:dind daemon for multi-host and TLS log streaming): real key and mouse input, with the rendered screen checked cell by cell. So far this has only been run on Linux.
 

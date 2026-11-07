@@ -195,6 +195,7 @@ enum DetailView {
         case .idle:
             return nil
         case .live:
+            if state.isPaused { return ("⏸ updates paused ", .warning) }
             return state.logFollow ? ("● live ", .success) : ("⏸ paused · f follow ", .warning)
         case .ended(nil):
             return ("■ ended ", .muted)
