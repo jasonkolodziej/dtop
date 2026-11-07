@@ -5,27 +5,16 @@ live resource graphs, a compose-aware container tree, per-container processes an
 start/stop/restart/kill/remove/prune workflows. It runs on macOS, Linux and Windows and has no
 third-party dependencies.
 
-```text
- dtop docker 29.9.2 · vm · 4 cpu · 16GiB                                                       ● 5 up  ◌ 2 down  12:47:06
-╭─ cpu ──────────────── 27.4% of 4 cpu ─╮╭─ mem ──────────────── 351MiB / 16GiB ─╮╭─ net ────────────────── ↓0B/s ↑0B/s ─╮
-│                                       ││                                       ││                                      │
-│                                       ││                                       ││                                      │
-│                                       ││                                       ││                                      │
-│                                  ⣀⣀⣄⣀⣀││                                       ││                                      │
-│                                  ⣿⣿⣿⣿⣿││                                 ⢀⣀⣀⣀⣀⣀││                                      │
-╰───────────────────────────────────────╯╰───────────────────────────────────────╯╰──────────────────────────────────────╯
-  1 Containers 7   2 Compose 1   3 Images 3   4 Networks 4   5 Volumes 0                                              all
-╭─ compose 1 ────────────────────────────────────────────────────────╮╭─ demoapp-web-1 ──────────────────────────────────╮
-│  NAME                STATE        CPU%     MEM  MEM% SERVICE       ││ Overview   Processes   Logs                      │
-│▾ demoapp             4/4 up      101.0  8.0MiB       burner, web, …││PID      CPU  COMMAND                             │
-│● ├─ demoapp-burner-1 running      99.6  596KiB   0.0 burner        ││3919    0    nginx: master process nginx -g daemon│
-│● ├─ demoapp-web-1    running ✓     1.3  5.3MiB   0.0 web           ││3978    0    ├─ nginx: worker process             │
-│● ├─ demoapp-worker-1 running       0.1  1.1MiB   0.0 worker        ││3980    0    ├─ nginx: worker process             │
-│● └─ demoapp-worker-2 running       0.1  1.0MiB   0.0 worker        ││3981    0    ├─ nginx: worker process             │
-│                                                                    ││3982    0    └─ nginx: worker process             │
-╰────────────────────────────────────────────────────────────────────╯╰──────────────────────────────────────────────────╯
- q quit  ? help  / filter  ⏎ fold  u start  U up  x stop  r restart  D down  v pane  t theme
-```
+![dtop showing containers, live CPU/memory/network graphs and container details](docs/screenshots/containers.png)
+
+| Compose tree and process tree | Live logs |
+| --- | --- |
+| ![Compose project tree with an nginx process tree](docs/screenshots/compose-processes.png) | ![Container logs pane](docs/screenshots/logs.png) |
+| **Theme menu with live preview** | **Confirmation for destructive actions** |
+| ![Theme editor panel over the live UI](docs/screenshots/theme-editor.png) | ![Remove-container confirmation dialog](docs/screenshots/confirm.png) |
+
+All screenshots are real captures of dtop against a running Docker daemon
+([how they're made](scripts/screenshots/README.md)).
 
 ## Features
 
@@ -41,9 +30,9 @@ third-party dependencies.
   images, networks and volumes. Destructive actions ask for confirmation, and **No** is focused
   by default.
 - **Keyboard and mouse**: vim and arrow keys, clickable tabs, rows and panes, and wheel scrolling.
-- **Themes**: five built-in themes (`harbor`, `daylight`, `midnight`, `ansi`, `monochrome`) and a
-  simple theme-file format. Truecolor is downsampled automatically to 256 or 16 colors, and
-  `NO_COLOR` is honoured.
+- **Themes**: ten built-in themes and a simple theme-file format. A theme menu (`T`) previews every
+  change on the live UI and only keeps it if you save. Truecolor is downsampled automatically to
+  256 or 16 colors, and `NO_COLOR` is honoured.
 - **Low overhead**: the screen is diffed so only changed cells are redrawn. Metric history lives
   in fixed-size ring buffers, stats requests run with bounded concurrency, and the event stream
   triggers refreshes instead of tighter polling.
@@ -105,7 +94,8 @@ you can use it in scripts and CI.
 | `u` `x` `r` `p` `K` `D` | start/unpause, stop, restart, pause/unpause, kill, remove |
 | `U` / `D` on a project | `docker compose up -d` / `docker compose down` |
 | `X` | prune the current view's resource type |
-| `t` / `space` / `R` | cycle theme / pause updates / refresh now |
+| `T` or `F2` | theme menu: edit with live preview, `s` to save, `Esc` to discard |
+| `t` / `space` / `R` | cycle theme for this session (not saved) / pause updates / refresh now |
 | `?` / `q` `Ctrl-C` | help / quit |
 
 ## Configuration
@@ -125,7 +115,36 @@ sort = cpu
 history = 600
 ```
 
-Custom themes go in `themes/<name>.theme` in the same directory. Start from a built-in theme:
+## Themes
+
+![The eight color themes side by side](docs/screenshots/themes.png)
+
+The built-in themes are `harbor` (the default), `daylight`, `midnight`, `ember`, `forest`,
+`glacier`, `dusk`, `contrast`, `ansi` (follows your terminal's 16-color palette) and `monochrome`
+(no color, uses reverse video). `daylight` and `glacier` are made for light terminal backgrounds,
+and `contrast` maximizes legibility. Run `dtop --list-themes` to see them all, including your own.
+
+### Theme menu
+
+Press `T` (or `F2`) to open the theme menu. While it is open, the whole UI renders with your
+draft, so you see every change on real data as you make it.
+
+| Keys | Action |
+| --- | --- |
+| `↑↓` `j` `k`, wheel, click | pick a row: base theme, borders, emphasis, or any of the 35 color roles |
+| `←→` (`Shift` or `H`/`L` for big steps) | change the value; on a color row, nudge the selected R/G/B channel |
+| `Tab` / `Shift-Tab` | switch between the R, G and B channels |
+| `Enter` | type a color: `#4fb0f5`, `#fff`, `rgb(1,2,3)`, `color(42)`, `red`, `bright-blue` or `default` |
+| `d` / `r` | reset the row to the base theme / revert every change |
+| `s` | save under a name (lowercase letters, digits, `-`, `_`) |
+| `Esc` | close; if there are unsaved changes dtop asks before discarding them |
+
+Saving writes `themes/<name>.theme` and sets `theme = <name>` in `dtop.conf`. It keeps the rest of
+that file as it is, including comments. If you pick an unmodified built-in theme, saving only
+updates `dtop.conf`. Closing without saving restores the previous theme, and nothing is written.
+`t` cycles themes for the current session only.
+
+Theme files are plain text, so you can also write them by hand. Start from a built-in theme:
 
 ```bash
 dtop --print-theme harbor > ~/.config/dtop/themes/mine.theme
@@ -136,7 +155,8 @@ name = mine
 inherits = harbor
 accent = #4fb0f5
 status_running = green
-border_style = rounded   # rounded, single, double, heavy, ascii
+# border styles: rounded, single, double, heavy, ascii
+border_style = rounded
 ```
 
 ## Architecture

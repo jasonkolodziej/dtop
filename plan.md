@@ -31,8 +31,10 @@ dependencies.
 ### Phase 2: Terminal UI foundation ✅
 - Screen buffer with wide-character handling, and a diff renderer that only emits changed cells
 - Layout solver (fixed, percent and weighted fill); responsive placement of the details panel
-- Themes: semantic roles, five built-ins, a theme-file format, truecolor→256→16 downsampling,
+- Themes: semantic roles, ten built-ins, a theme-file format, truecolor→256→16 downsampling,
   `NO_COLOR`
+- Theme menu (`T`/`F2`): live preview on the running UI; per-role RGB nudging or typed colors;
+  explicit save to `themes/<name>.theme` + `dtop.conf`, otherwise revert
 - Input parser: keys, xterm modifiers, CSI u, SGR and X10 mouse, bracketed paste, ESC timing;
   raw mode via termios and the Windows console
 
@@ -54,6 +56,8 @@ dependencies.
 - ✅ Actionable error messages throughout; a terminal-too-small fallback; signal-safe terminal
   restore
 - ✅ 3-OS CI matrix (Linux, macOS, Windows); integration tests against a real daemon on Linux
+- ✅ End-to-end checks of mouse input and the theme menu in a pseudo-terminal against a live daemon
+- ✅ Real screenshots in `docs/screenshots/` (regenerate with `scripts/screenshots/`)
 - ⏳ Interactive testing on real macOS and Windows terminals (CI covers build and unit tests only)
 - ⏳ Profiling on hosts with hundreds of containers (stats fan-out is capped at 8 concurrent
   requests)
