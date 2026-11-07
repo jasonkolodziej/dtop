@@ -42,7 +42,10 @@ dependencies.
 - Host CPU, memory and network braille graphs; per-container sparklines and rates
 - Containers, Compose (project → container tree), Images, Networks and Volumes tabs
 - Details panel: overview (inspect), processes (`top` as a tree), logs (demuxed, sanitized)
-- Status and health color coding; text filter; running/stopped filter; six sort keys
+- Status and health color coding; text filter; running/stopped filter; seven sort keys
+- GPU monitoring: host GPU graph plus per-container GPU%/memory for NVIDIA (`nvidia-smi`),
+  AMD (amdgpu sysfs + DRM fdinfo) and Intel (DRM fdinfo) on Linux; NVIDIA host graph on Windows;
+  Apple Silicon host graph on macOS (IOKit). See ADR 0002
 
 ### Phase 4: Management workflows ✅
 - Start, stop, restart, pause, unpause, kill and remove for containers
@@ -59,10 +62,14 @@ dependencies.
 - ✅ End-to-end checks of mouse input and the theme menu in a pseudo-terminal against a live daemon
 - ✅ Real screenshots in `docs/screenshots/` (regenerate with `scripts/screenshots/`)
 - ⏳ Interactive testing on real macOS and Windows terminals (CI covers build and unit tests only)
+- ⏳ GPU monitoring on real NVIDIA, AMD, Intel and Apple hardware (verified so far with
+  unit tests and a stand-in `nvidia-smi`)
 - ⏳ Profiling on hosts with hundreds of containers (stats fan-out is capped at 8 concurrent
   requests)
 
 ## Next Up
+- GPU: AMD and Intel on Windows via performance counters (`\GPU Engine(*)\Utilization Percentage`);
+  optionally use AMD SMI / NVML directly (loaded at runtime) for richer metrics
 - Follow logs live (`logs?follow=1`) instead of re-fetching the tail each tick
 - `exec` into a container (hand the TTY to `docker exec -it`)
 - TLS for `tcp://` endpoints (`DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`) and TCP on Windows

@@ -10,7 +10,7 @@ This repository is **dtop**, a Swift terminal UI (in the spirit of `btop`/`htop`
 
 - **Zero third-party dependencies.** Use Foundation and the platform C libraries only (`Darwin`, `Glibc`/`Musl`, `WinSDK`/`ucrt`). Don't add Swift packages.
 - **Module layout**:
-  - `DtopCore`: Docker transports, HTTP client, API client and models, metrics math.
+  - `DtopCore`: Docker transports, HTTP client, API client and models, metrics math, GPU collectors.
   - `DtopUI`: rendering, widgets, themes, input parsing, terminal I/O.
   - `DtopApp`: state, reducer, views and runtime.
   - `dtop`: a one-line `main.swift`.

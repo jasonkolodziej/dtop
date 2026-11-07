@@ -47,3 +47,4 @@ What are the resulting trade-offs, follow-up tasks, or risks?
 | # | Title | Status | Date |
 |---|-------|--------|------|
 | [0001](./0001-zero-dependency-cross-platform-architecture.md) | Zero-dependency, cross-platform architecture | Accepted | 2026-11-07 |
+| [0002](./0002-gpu-monitoring-sources.md) | GPU monitoring data sources | Accepted | 2026-11-07 |
