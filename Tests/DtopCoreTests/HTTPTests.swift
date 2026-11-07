@@ -72,6 +72,8 @@ struct HTTPHeadersTests {
     @Test("equality compares names and values in order")
     func equality() {
         #expect(HTTPHeaders([("A", "1")]) == HTTPHeaders([("A", "1")]))
+        #expect(HTTPHeaders([("Host", "docker")]) == HTTPHeaders([("host", "docker")]), "names are case-insensitive")
+        #expect(HTTPHeaders([("Host", "docker")]) != HTTPHeaders([("Host", "Docker")]), "values are case-sensitive")
         #expect(HTTPHeaders([("A", "1")]) != HTTPHeaders([("A", "2")]))
         #expect(HTTPHeaders([("A", "1"), ("B", "2")]) != HTTPHeaders([("B", "2"), ("A", "1")]))
     }

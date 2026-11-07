@@ -41,7 +41,9 @@ jobs:
       # declares swift-tools-version 6.0.
       - name: Set up Swift (Windows)
         if: runner.os == 'Windows'
-        uses: compnerd/gha-setup-swift@main
+        # Pinned to the commit of compnerd/gha-setup-swift `main` this workflow was validated with
+        # (2026-11-07); bump deliberately.
+        uses: compnerd/gha-setup-swift@57fe462cd3c7b05ae8fcff79b00719312e305257
         with:
           branch: swift-6.2-release
           tag: 6.2-RELEASE

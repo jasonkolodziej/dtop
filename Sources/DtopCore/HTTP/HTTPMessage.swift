@@ -39,9 +39,12 @@ public struct HTTPHeaders: Sendable, Equatable, Sequence {
         entries.makeIterator()
     }
 
+    /// Field names compare case-insensitively (RFC 9110 §5.1); values and order must match exactly.
     public static func == (lhs: HTTPHeaders, rhs: HTTPHeaders) -> Bool {
         lhs.entries.count == rhs.entries.count
-            && zip(lhs.entries, rhs.entries).allSatisfy { $0.name == $1.name && $0.value == $1.value }
+            && zip(lhs.entries, rhs.entries).allSatisfy {
+                $0.name.lowercased() == $1.name.lowercased() && $0.value == $1.value
+            }
     }
 }
 
