@@ -9,7 +9,7 @@ on:
 jobs:
   lint-and-validate:
     name: Lint & Validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     permissions:
       contents: read
@@ -18,10 +18,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+
       # ---------------------------------------------------------------
       # Add language-specific lint, build, and test steps below.
       # The steps below are general-purpose checks suitable for any repo.
       # ---------------------------------------------------------------
+
+      - name: Build Swift package
+        run: swift build
+
+      - name: Test Swift package
+        run: swift test
 
       - name: Install YAML validator dependency
         run: python3 -m pip install --disable-pip-version-check --user pyyaml
