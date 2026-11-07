@@ -156,6 +156,10 @@ struct TransportFactoryTests {
         #if os(Windows)
         #expect(try TransportFactory.make(for: .namedPipe(path: #"\\.\pipe\x"#)) is NamedPipeTransport)
         #expect(throws: DockerError.self) { try TransportFactory.make(for: .unixSocket(path: "/x")) }
+        #expect(try TransportFactory.make(for: .tcp(host: "h", port: 1)) is WinsockTCPTransport)
+        // Nothing listens on port 1: Winsock reports a connection failure rather than hanging.
+        #expect(throws: DockerError.self) { _ = try WinsockTCPTransport(host: "127.0.0.1", port: 1, timeoutSeconds: 2).connect() }
+        #expect(throws: DockerError.self) { _ = try WinsockTCPTransport(host: "no-such-host.invalid", port: 2375).connect() }
         #else
         #expect(try TransportFactory.make(for: .unixSocket(path: "/x")) is UnixSocketTransport)
         #expect(try TransportFactory.make(for: .tcp(host: "h", port: 1)) is TCPTransport)

@@ -114,7 +114,12 @@ enum TLSSupport {
             return "\(endpoint) rejected the client certificate (\(detail)) — it must be issued by the CA "
                 + "the daemon trusts (dockerd --tlscacert)"
         }
-        return "TLS handshake with \(endpoint) failed: \(detail)"
+        var message = "TLS handshake with \(endpoint) failed: \(detail)"
+        if !configuration.hasClientCertificate {
+            message += " — if the daemon requires a client certificate, pass --tlscert and --tlskey, "
+                + "or put cert.pem and key.pem in ~/.docker (or DOCKER_CERT_PATH)"
+        }
+        return message
     }
 }
 

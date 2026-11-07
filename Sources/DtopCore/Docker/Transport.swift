@@ -29,7 +29,7 @@ public enum TransportFactory {
             #endif
         case .tcp(let host, let port):
             #if os(Windows)
-            throw DockerError.unsupportedEndpoint("tcp://\(host):\(port) (tcp is not yet supported on Windows)")
+            return WinsockTCPTransport(host: host, port: port, timeoutSeconds: timeoutSeconds)
             #else
             return TCPTransport(host: host, port: port, timeoutSeconds: timeoutSeconds)
             #endif

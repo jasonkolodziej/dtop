@@ -176,9 +176,7 @@ struct TLSSupportTests {
         let transport = try #require(try TransportFactory.make(for: tlsHost) as? TLSTransport)
         #expect(transport.serverName == "h")
         #expect(transport.endpoint == .tcp(host: "h", port: 2376))
-        #if !os(Windows)
         let plainHost = DockerHost(name: "b", endpoint: .tcp(host: "h", port: 2375))
         #expect(!(try TransportFactory.make(for: plainHost) is TLSTransport))
-        #endif
     }
 }
