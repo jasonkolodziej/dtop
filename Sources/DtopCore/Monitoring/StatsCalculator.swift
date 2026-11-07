@@ -15,6 +15,10 @@ public struct ResourceSample: Sendable, Equatable {
     public var blockReadTotal: UInt64
     public var blockWriteTotal: UInt64
     public var pids: UInt64
+    /// Share of the host's GPUs this container keeps busy (0-100), nil when unknown.
+    public var gpuPercent: Double?
+    /// GPU memory used by the container's processes, nil when unknown.
+    public var gpuMemory: UInt64?
 
     public init(
         timestamp: Double = 0,
@@ -30,7 +34,9 @@ public struct ResourceSample: Sendable, Equatable {
         networkTxTotal: UInt64 = 0,
         blockReadTotal: UInt64 = 0,
         blockWriteTotal: UInt64 = 0,
-        pids: UInt64 = 0
+        pids: UInt64 = 0,
+        gpuPercent: Double? = nil,
+        gpuMemory: UInt64? = nil
     ) {
         self.timestamp = timestamp
         self.cpuPercent = cpuPercent
@@ -46,6 +52,8 @@ public struct ResourceSample: Sendable, Equatable {
         self.blockReadTotal = blockReadTotal
         self.blockWriteTotal = blockWriteTotal
         self.pids = pids
+        self.gpuPercent = gpuPercent
+        self.gpuMemory = gpuMemory
     }
 
     public var memoryPercent: Double {

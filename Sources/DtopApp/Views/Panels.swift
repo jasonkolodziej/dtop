@@ -18,6 +18,8 @@ enum HeaderView {
             if !info.name.isEmpty { facts.append(info.name) }
             if info.cpuCount > 0 { facts.append("\(info.cpuCount) cpu") }
             if info.memoryTotal > 0 { facts.append(Format.bytes(info.memoryTotal)) }
+            let gpus = snapshot.metrics.gpu.devices.count
+            if gpus > 0 { facts.append("\(gpus) gpu") }
         }
         if facts.isEmpty { facts.append(snapshot.endpoint) }
 
@@ -56,13 +58,56 @@ enum HeaderView {
 
 enum MetricsView {
     static func draw(into buffer: inout ScreenBuffer, rect: Rect, context: RenderContext) {
+        let hasGPU = !context.snapshot.metrics.gpu.devices.isEmpty
         let wide = rect.width >= 90
-        let parts = rect.split(.horizontal, wide ? [.fill(2), .fill(2), .fill(2)] : [.fill(1), .fill(1)])
-        drawCPU(into: &buffer, rect: parts[0], context: context)
-        drawMemory(into: &buffer, rect: parts[1], context: context)
-        if wide {
-            drawNetwork(into: &buffer, rect: parts[2], context: context)
+        // With a GPU: cpu · mem · gpu · net when wide (≥ 120), cpu · mem · gpu when not.
+        var panels: [(inout ScreenBuffer, Rect, RenderContext) -> Void] = [drawCPU, drawMemory]
+        if hasGPU { panels.append(drawGPU) }
+        if wide && (!hasGPU || rect.width >= 120) { panels.append(drawNetwork) }
+        if !hasGPU && !wide { panels = [drawCPU, drawMemory] }
+        let parts = rect.split(.horizontal, Array(repeating: .fill(1), count: panels.count))
+        for (panel, part) in zip(panels, parts) {
+            panel(&buffer, part, context)
         }
+    }
+
+    static func drawGPU(into buffer: inout ScreenBuffer, rect: Rect, context: RenderContext) {
+        let theme = context.theme
+        let gpu = context.snapshot.metrics.gpu
+        let utilization = gpu.averageUtilization
+        var label = utilization.map { Format.percent($0, decimals: 0) } ?? "n/a"
+        if let used = gpu.totalMemoryUsed {
+            label += " · " + Format.bytes(used) + (gpu.totalMemory.map { " / " + Format.bytes($0) } ?? "")
+        }
+        // Title stays short so the numbers fit; the model name goes inside the box.
+        let title = gpu.devices.count == 1 ? "gpu" : "gpu ×\(gpu.devices.count)"
+        let inner = Box.draw(into: &buffer, rect: rect, title: title, label: label, borderStyle: theme.style(.border),
+                             titleStyle: theme.style(.gpu).bold, characters: theme.border)
+        guard !inner.isEmpty else { return }
+        let history = context.snapshot.metrics.total.gpu.elements.map { $0 / 100 }
+        BrailleGraph.draw(into: &buffer, rect: inner, values: history, maximum: 1) { fraction in
+            Style(foreground: Color.blend(theme[.gpu], theme[.graphHigh], fraction: fraction * 0.7),
+                  background: theme[.background])
+        }
+        var noteRow = inner.y
+        if inner.height >= 3 {
+            let names = gpu.devices.map(shortGPUName)
+            let caption = names.count == 1 ? names[0] : names.joined(separator: ", ")
+            buffer.write(TextWidth.truncate(caption, to: inner.width), x: inner.x, y: noteRow, style: theme.style(.muted))
+            noteRow += 1
+        }
+        if let issue = gpu.issues.first, noteRow < inner.maxY - 1 {
+            buffer.write(TextWidth.truncate(issue, to: inner.width), x: inner.x, y: noteRow, style: theme.style(.muted))
+        }
+    }
+
+    /// "NVIDIA GeForce RTX 3080" → "GeForce RTX 3080": the vendor is implied by the model.
+    static func shortGPUName(_ device: GPUDevice) -> String {
+        for prefix in ["NVIDIA ", "AMD ", "Intel(R) ", "Intel ", "Apple "] where device.name.hasPrefix(prefix) {
+            let rest = String(device.name.dropFirst(prefix.count))
+            return rest.isEmpty ? device.name : rest
+        }
+        return device.name
     }
 
     static func hostCPUCount(_ context: RenderContext) -> Int {

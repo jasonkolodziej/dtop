@@ -94,9 +94,14 @@ enum DetailView {
             lines.append(("net", "↓\(Format.rate(sample.networkRxRate)) ↑\(Format.rate(sample.networkTxRate))", nil))
             lines.append(("disk", "r \(Format.rate(sample.blockReadRate)) w \(Format.rate(sample.blockWriteRate))", nil))
             lines.append(("pids", String(sample.pids), nil))
+            if let gpu = sample.gpuPercent {
+                let memory = sample.gpuMemory.map { " · " + Format.bytes($0) } ?? ""
+                lines.append(("gpu", Format.percent(gpu) + memory, .gpu))
+            }
         }
         if let details {
             if !details.commandLine.isEmpty { lines.append(("command", details.commandLine, nil)) }
+            for access in details.gpuAccess { lines.append(("gpu access", access, .gpu)) }
             if details.restartCount > 0 || !details.restartPolicy.isEmpty {
                 let policy = details.restartPolicy.isEmpty ? "no" : details.restartPolicy
                 lines.append(("restarts", "\(details.restartCount) (policy \(policy))",
@@ -141,6 +146,12 @@ enum DetailView {
             buffer.write(Sparkline.render(values: series.memory.elements, width: width), x: area.x + 4, y: area.y + 1,
                          style: theme.style(.memory))
             area = area.inset(top: 3)
+            if context.snapshot.metrics.latest[container.id]?.gpuPercent != nil, area.height >= 6 {
+                buffer.write("gpu ", x: area.x, y: area.y - 1, style: theme.style(.muted))
+                buffer.write(Sparkline.render(values: series.gpu.elements, width: width, maximum: 100), x: area.x + 4,
+                             y: area.y - 1, style: theme.style(.gpu))
+                area = area.inset(top: 1)
+            }
         }
         let lines = containerLines(container, details: detail?.details, sample: context.snapshot.metrics.latest[container.id])
         renderKeyValues(into: &buffer, rect: area, lines: lines, scroll: context.state.detailScroll, theme: theme)

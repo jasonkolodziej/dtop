@@ -123,6 +123,13 @@ public enum ListModel {
                 let left = latest[lhs.id]?.memoryUsage ?? 0
                 let right = latest[rhs.id]?.memoryUsage ?? 0
                 return left == right ? nil : left < right
+            case .gpu:
+                let left = latest[lhs.id]?.gpuPercent ?? -1
+                let right = latest[rhs.id]?.gpuPercent ?? -1
+                if left != right { return left < right }
+                let leftMemory = latest[lhs.id]?.gpuMemory ?? 0
+                let rightMemory = latest[rhs.id]?.gpuMemory ?? 0
+                return leftMemory == rightMemory ? nil : leftMemory < rightMemory
             case .status:
                 return lhs.state.sortRank == rhs.state.sortRank ? nil : lhs.state.sortRank < rhs.state.sortRank
             case .created:

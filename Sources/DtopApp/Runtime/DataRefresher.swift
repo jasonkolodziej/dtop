@@ -5,6 +5,7 @@ import DtopCore
 public actor DataRefresher {
     public let api: any DockerAPI
     public let commandRunner: any CommandRunning
+    public let gpuCollector: (any GPUCollecting)?
     public let endpoint: DockerEndpoint?
     public private(set) var snapshot: DockerSnapshot
     private var sampler = StatsSampler()
@@ -19,6 +20,7 @@ public actor DataRefresher {
         endpointDescription: String,
         endpoint: DockerEndpoint? = nil,
         commandRunner: any CommandRunning = ProcessCommandRunner(),
+        gpuCollector: (any GPUCollecting)? = nil,
         historySize: Int = 240,
         statsConcurrency: Int = 8,
         logTail: Int = 300,
@@ -29,6 +31,7 @@ public actor DataRefresher {
         self.api = api
         self.endpoint = endpoint
         self.commandRunner = commandRunner
+        self.gpuCollector = gpuCollector
         self.snapshot = DockerSnapshot(endpoint: endpointDescription, metrics: MetricsStore(capacity: historySize))
         self.statsConcurrency = max(1, statsConcurrency)
         self.logTail = logTail
@@ -55,7 +58,11 @@ public actor DataRefresher {
                 samples[id] = sampler.ingest(id: id, stats: stats, now: now)
             }
             sampler.retain(ids: Set(rawStats.keys))
-            snapshot.metrics.record(samples, timestamp: now)
+            let gpu = await gpuCollector?.sample(now: now)
+            if let gpu, !gpu.devices.isEmpty {
+                Self.attributeGPU(gpu, to: &samples)
+            }
+            snapshot.metrics.record(samples, timestamp: now, gpu: gpu)
             snapshot.containers = containers
 
             var warnings: [String] = []
@@ -75,6 +82,22 @@ public actor DataRefresher {
             markDisconnected(error, now: now)
         }
         return snapshot
+    }
+
+    /// Adds per-container GPU usage to the samples. Containers whose IDs appear in the GPU
+    /// process list get their share; when attribution was complete the rest are known to be at 0,
+    /// otherwise they stay unknown (nil).
+    static func attributeGPU(_ gpu: GPUSample, to samples: inout [String: ResourceSample]) {
+        let usage = gpu.usageByContainer()
+        for id in samples.keys {
+            if let entry = usage[id] {
+                samples[id]?.gpuPercent = entry.utilization
+                samples[id]?.gpuMemory = entry.memory
+            } else if gpu.processAttributionComplete {
+                samples[id]?.gpuPercent = 0
+                samples[id]?.gpuMemory = 0
+            }
+        }
     }
 
     private func markDisconnected(_ error: Error, now: Double) {

@@ -76,6 +76,7 @@ public enum DtopMain {
             api: client,
             endpointDescription: endpoint.description,
             endpoint: configuration.host == nil && environment["DOCKER_HOST"] == nil ? nil : endpoint,
+            gpuCollector: configuration.gpu ? SystemGPUCollector.makeDefault(environment: environment, platform: platform) : nil,
             historySize: configuration.historySize,
             clock: { Date().timeIntervalSince1970 }
         )

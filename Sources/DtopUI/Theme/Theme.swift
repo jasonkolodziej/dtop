@@ -30,6 +30,7 @@ public enum ThemeRole: String, Sendable, CaseIterable, Hashable {
     case networkRx = "network_rx"
     case networkTx = "network_tx"
     case disk
+    case gpu
     case success
     case warning
     case error
@@ -121,6 +122,7 @@ public struct Theme: Sendable, Equatable {
         .networkRx: .rgb(0x4F, 0xC0, 0xC8),
         .networkTx: .rgb(0xE3, 0xBF, 0x6E),
         .disk: .rgb(0xF0, 0x98, 0x4A),
+        .gpu: .rgb(0xF0, 0x78, 0xB4),
         .success: .rgb(0x5C, 0xCF, 0x8B),
         .warning: .rgb(0xE3, 0xBF, 0x6E),
         .error: .rgb(0xE5, 0x5F, 0x5F),
@@ -160,6 +162,7 @@ public struct Theme: Sendable, Equatable {
         .networkRx: .rgb(0x0E, 0x7C, 0x86),
         .networkTx: .rgb(0x9A, 0x6B, 0x00),
         .disk: .rgb(0xB8, 0x5C, 0x00),
+        .gpu: .rgb(0xB0, 0x30, 0x6A),
         .success: .rgb(0x1E, 0x8E, 0x4E),
         .warning: .rgb(0x9A, 0x6B, 0x00),
         .error: .rgb(0xC0, 0x30, 0x30),
@@ -199,6 +202,7 @@ public struct Theme: Sendable, Equatable {
         .networkRx: .rgb(0x5A, 0xB8, 0xFF),
         .networkTx: .rgb(0xF2, 0xC4, 0x5A),
         .disk: .rgb(0xFF, 0x9F, 0x5A),
+        .gpu: .rgb(0xFF, 0x7A, 0xA8),
         .success: .rgb(0x3D, 0xD6, 0x8C),
         .warning: .rgb(0xF2, 0xC4, 0x5A),
         .error: .rgb(0xFF, 0x5F, 0x87),
@@ -238,6 +242,7 @@ public struct Theme: Sendable, Equatable {
         .networkRx: .cyan,
         .networkTx: .yellow,
         .disk: .brightYellow,
+        .gpu: .brightGreen,
         .success: .green,
         .warning: .yellow,
         .error: .red,

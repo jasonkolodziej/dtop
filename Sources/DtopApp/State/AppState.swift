@@ -31,6 +31,7 @@ public enum SortKey: String, Sendable, CaseIterable, Equatable {
     case name
     case cpu
     case memory
+    case gpu
     case status
     case created
     case image
@@ -41,7 +42,7 @@ public enum SortKey: String, Sendable, CaseIterable, Equatable {
     }
 
     /// Whether descending is the natural first direction (biggest consumers first).
-    public var prefersDescending: Bool { self == .cpu || self == .memory || self == .created }
+    public var prefersDescending: Bool { self == .cpu || self == .memory || self == .gpu || self == .created }
 }
 
 public enum StatusFilter: String, Sendable, CaseIterable, Equatable {

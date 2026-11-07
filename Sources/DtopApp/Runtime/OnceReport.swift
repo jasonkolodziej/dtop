@@ -18,12 +18,24 @@ public enum OnceReport {
         lines.append("containers: \(snapshot.runningCount) running, \(snapshot.stoppedCount) stopped · "
             + "cpu \(Format.percent(total.cpuPercent)) · mem \(Format.bytes(total.memoryUsage)) · "
             + "net ↓\(Format.rate(total.networkRxRate)) ↑\(Format.rate(total.networkTxRate))")
+        let gpu = snapshot.metrics.gpu
+        for device in gpu.devices {
+            var line = "gpu: \(device.name)"
+            if let utilization = device.utilization { line += " · \(Format.percent(utilization))" }
+            if let used = device.memoryUsed {
+                line += " · \(Format.bytes(used))" + (device.memoryTotal.map { " / \(Format.bytes($0))" } ?? "")
+            }
+            lines.append(line)
+        }
+        for issue in gpu.issues { lines.append("gpu: \(issue)") }
         lines.append("")
 
-        let columns: [(String, Int, TextAlignment)] = [
+        let showGPU = !gpu.devices.isEmpty
+        var columns: [(String, Int, TextAlignment)] = [
             ("NAME", 28, .left), ("STATE", 10, .left), ("CPU%", 7, .right), ("MEM", 9, .right),
             ("MEM%", 6, .right), ("PROJECT", 16, .left), ("IMAGE", 30, .left)
         ]
+        if showGPU { columns.insert(("GPU%", 6, .right), at: 5) }
         func format(_ cells: [String]) -> String {
             let text = zip(columns, cells).map { column, cell in
                 TextWidth.fit(cell, to: column.1, alignment: column.2)
@@ -37,7 +49,7 @@ public enum OnceReport {
         for container in sorted {
             let sample = snapshot.metrics.latest[container.id]
             let active = container.state.isActive && sample != nil
-            lines.append(format([
+            var cells = [
                 container.name,
                 container.state.rawValue,
                 active ? Format.fixed(sample!.cpuPercent, decimals: 1) : "-",
@@ -45,7 +57,11 @@ public enum OnceReport {
                 active && sample!.memoryLimit > 0 ? Format.fixed(sample!.memoryPercent, decimals: 1) : "-",
                 container.composeProject ?? "",
                 container.image
-            ]))
+            ]
+            if showGPU {
+                cells.insert(active ? (sample!.gpuPercent.map { Format.fixed($0, decimals: 1) } ?? "-") : "-", at: 5)
+            }
+            lines.append(format(cells))
         }
         if snapshot.containers.isEmpty { lines.append("(no containers)") }
         return lines.joined(separator: "\n") + "\n"

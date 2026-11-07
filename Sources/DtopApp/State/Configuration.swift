@@ -27,6 +27,8 @@ public struct AppConfiguration: Sendable, Equatable {
     public var themeName: String = "harbor"
     public var colorMode: ColorMode?
     public var mouse = true
+    /// Collect GPU metrics (runs `nvidia-smi` / reads sysfs and procfs each refresh).
+    public var gpu = true
     public var showStopped = true
     public var sortKey: SortKey = .cpu
     /// nil means "the natural direction for the sort key" (biggest consumers first for cpu/memory).
@@ -79,6 +81,8 @@ public struct AppConfiguration: Sendable, Equatable {
             }
         case "mouse":
             mouse = try Self.parseBool(value, key: key)
+        case "gpu":
+            gpu = try Self.parseBool(value, key: key)
         case "show_stopped", "all":
             showStopped = try Self.parseBool(value, key: key)
         case "sort":
@@ -140,8 +144,9 @@ public struct AppConfiguration: Sendable, Equatable {
       -t, --theme <name|file>   Built-in theme name or path to a .theme file (default harbor)
           --color <mode>        auto, truecolor, 256, 16 or none (default auto; honours NO_COLOR)
           --running             Only list running containers
-          --sort <key>          Initial sort: name, cpu, memory, status, created, image
+          --sort <key>          Initial sort: name, cpu, memory, gpu, status, created, image
           --no-mouse            Disable mouse reporting
+          --no-gpu              Don't collect GPU metrics (NVIDIA, AMD, Intel, Apple)
           --history <samples>   Samples kept per graph (30-3600, default 240)
       -c, --config <file>       Read settings from this file instead of the default location
           --once                Print one plain-text snapshot and exit (scriptable)
@@ -215,6 +220,10 @@ public struct AppConfiguration: Sendable, Equatable {
                 try apply(key: "sort", value: try value())
             case "--no-mouse":
                 mouse = false
+            case "--no-gpu":
+                gpu = false
+            case "--gpu":
+                gpu = true
             case "--mouse":
                 mouse = true
             case "--history":

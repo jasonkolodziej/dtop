@@ -100,6 +100,9 @@ public struct ContainerDetails: Sendable, Equatable, Decodable {
     public var mounts: [Mount]
     public var networks: [NetworkAttachment]
     public var portBindings: [String: [String]]
+    /// GPUs the container was given: `--gpus` device requests and GPU device nodes
+    /// (`/dev/dri/*`, `/dev/kfd`, `/dev/nvidia*`).
+    public var gpuAccess: [String]
 
     enum CodingKeys: String, CodingKey {
         case id = "Id", name = "Name", created = "Created", path = "Path", args = "Args", state = "State"
@@ -114,6 +117,7 @@ public struct ContainerDetails: Sendable, Equatable, Decodable {
 
     enum HostConfigKeys: String, CodingKey {
         case restartPolicy = "RestartPolicy", memory = "Memory", nanoCPUs = "NanoCpus"
+        case deviceRequests = "DeviceRequests", devices = "Devices"
     }
 
     enum RestartPolicyKeys: String, CodingKey {
@@ -169,10 +173,12 @@ public struct ContainerDetails: Sendable, Equatable, Decodable {
             }
             memoryLimit = hostConfig.flexibleInt(.memory) ?? 0
             nanoCPUs = hostConfig.flexibleInt(.nanoCPUs) ?? 0
+            gpuAccess = Self.gpuAccess(hostConfig)
         } else {
             restartPolicy = ""
             memoryLimit = 0
             nanoCPUs = 0
+            gpuAccess = []
         }
 
         var networks: [NetworkAttachment] = []
@@ -208,6 +214,44 @@ public struct ContainerDetails: Sendable, Equatable, Decodable {
         }
         self.networks = networks.sorted { $0.name < $1.name }
         self.portBindings = portBindings
+    }
+
+    struct DeviceRequest: Decodable {
+        var driver: String?
+        var count: Int?
+        var deviceIDs: [String]?
+        var capabilities: [[String]]?
+
+        enum CodingKeys: String, CodingKey {
+            case driver = "Driver", count = "Count", deviceIDs = "DeviceIDs", capabilities = "Capabilities"
+        }
+    }
+
+    struct DeviceMapping: Decodable {
+        var pathOnHost: String?
+
+        enum CodingKeys: String, CodingKey { case pathOnHost = "PathOnHost" }
+    }
+
+    static func gpuAccess(_ hostConfig: KeyedDecodingContainer<HostConfigKeys>) -> [String] {
+        var access: [String] = []
+        let requests: [DeviceRequest] = hostConfig.lenient(.deviceRequests, default: [])
+        for request in requests where request.capabilities?.contains(where: { $0.contains("gpu") }) ?? true {
+            let driver = (request.driver?.isEmpty == false ? request.driver! : "gpu")
+            if let ids = request.deviceIDs, !ids.isEmpty {
+                access.append("\(driver): \(ids.joined(separator: ", "))")
+            } else if let count = request.count, count >= 0 {
+                access.append("\(driver): \(count) GPU\(count == 1 ? "" : "s")")
+            } else {
+                access.append("\(driver): all GPUs")
+            }
+        }
+        let devices: [DeviceMapping] = hostConfig.lenient(.devices, default: [])
+        let gpuNodes = devices.compactMap(\.pathOnHost).filter {
+            $0.hasPrefix("/dev/dri") || $0 == "/dev/kfd" || $0.hasPrefix("/dev/nvidia")
+        }
+        if !gpuNodes.isEmpty { access.append("devices: " + gpuNodes.joined(separator: ", ")) }
+        return access
     }
 
     /// The command line as Docker would show it.

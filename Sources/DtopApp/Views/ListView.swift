@@ -21,8 +21,9 @@ enum ListView {
             return TableLayout(headerRect: .zero, rowRects: [], columnWidths: [], scrollOffset: 0)
         }
 
-        let columns = Self.columns(for: tab)
-        let rows = items.map { row(for: $0, context: context) }
+        let showGPU = !context.snapshot.metrics.gpu.devices.isEmpty
+        let columns = Self.columns(for: tab, showGPU: showGPU)
+        let rows = items.map { row(for: $0, context: context, showGPU: showGPU) }
         let styles = TableStyles(
             header: theme.style(.tableHeader).bold,
             row: theme.base,
@@ -71,10 +72,10 @@ enum ListView {
         }
     }
 
-    static func columns(for tab: Tab) -> [TableColumn] {
+    static func columns(for tab: Tab, showGPU: Bool = false) -> [TableColumn] {
         switch tab {
         case .containers, .compose:
-            return [
+            return Self.withGPU(showGPU, [
                 TableColumn("", width: .fixed(1)),
                 TableColumn("NAME", width: .flexible(min: 14, weight: 3)),
                 TableColumn("STATE", width: .fixed(10), priority: 1),
@@ -85,7 +86,7 @@ enum ListView {
                 TableColumn(tab == .compose ? "SERVICE" : "IMAGE", width: .flexible(min: 12, weight: 2), priority: 2),
                 TableColumn("PORTS", width: .flexible(min: 12, weight: 1), priority: 6),
                 TableColumn("STATUS", width: .flexible(min: 14, weight: 2), priority: 5)
-            ]
+            ], gpuColumn: TableColumn("GPU%", width: .fixed(5), alignment: .right, priority: 3))
         case .images:
             return [
                 TableColumn("REPOSITORY:TAG", width: .flexible(min: 20, weight: 3)),
@@ -113,7 +114,21 @@ enum ListView {
         }
     }
 
-    static func row(for item: ListItem, context: RenderContext) -> [TableCell] {
+    /// Inserts the GPU column after MEM% (index 6) only when the host has a GPU, so machines
+    /// without one keep the narrower table.
+    static func withGPU<T>(_ show: Bool, _ items: [T], gpuColumn: T) -> [T] {
+        guard show else { return items }
+        var result = items
+        result.insert(gpuColumn, at: min(6, result.count))
+        return result
+    }
+
+    static func gpuCell(_ sample: ResourceSample?, active: Bool, theme: Theme) -> TableCell {
+        guard active, let percent = sample?.gpuPercent else { return TableCell("-", style: theme.style(.muted)) }
+        return TableCell(percentCell(percent), style: Style(foreground: theme.gradient(percent / 100)))
+    }
+
+    static func row(for item: ListItem, context: RenderContext, showGPU: Bool = false) -> [TableCell] {
         let theme = context.theme
         let metrics = context.snapshot.metrics
         switch item {
@@ -131,7 +146,7 @@ enum ListView {
             case .starting?: stateText = "starting"
             default: stateText = container.state.rawValue
             }
-            return [
+            return Self.withGPU(showGPU, [
                 TableCell(AppView.stateSymbol(container.state), style: stateStyle),
                 TableCell(name, style: depth > 0 ? nil : Style(attributes: .bold)),
                 TableCell(stateText, style: stateStyle),
@@ -146,7 +161,7 @@ enum ListView {
                           style: theme.style(.muted)),
                 TableCell(container.portSummary, style: theme.style(.muted)),
                 TableCell(container.status, style: theme.style(.muted))
-            ]
+            ], gpuColumn: gpuCell(sample, active: active, theme: theme))
 
         case .composeProject(let project, let collapsed):
             let role = AppView.composeRole(project.aggregateStatus)
@@ -154,15 +169,17 @@ enum ListView {
             var memory: UInt64 = 0
             var rx = 0.0
             var tx = 0.0
+            var gpu: Double?
             for container in project.containers {
                 guard let sample = metrics.latest[container.id] else { continue }
                 cpu += sample.cpuPercent
                 memory &+= sample.memoryUsage
                 rx += sample.networkRxRate
                 tx += sample.networkTxRate
+                if let share = sample.gpuPercent { gpu = (gpu ?? 0) + share }
             }
             let services = project.services.map(\.name).joined(separator: ", ")
-            return [
+            return Self.withGPU(showGPU, [
                 TableCell(collapsed ? "▸" : "▾", style: theme.style(.accent)),
                 TableCell(project.name, style: theme.style(.accent).bold),
                 TableCell("\(project.runningCount)/\(project.containers.count) up", style: theme.style(role)),
@@ -173,7 +190,7 @@ enum ListView {
                 TableCell(services, style: theme.style(.muted)),
                 TableCell(""),
                 TableCell(project.aggregateStatus.rawValue, style: theme.style(role))
-            ]
+            ], gpuColumn: TableCell(gpu.map { percentCell(min(100, $0)) } ?? "", style: theme.style(.gpu)))
 
         case .image(let image):
             return [
