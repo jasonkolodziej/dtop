@@ -56,8 +56,12 @@ since CryptoKit is Apple-only).
 ## Consequences
 
 - No new dependencies. Linux needs `libssl` at runtime only when TLS is used.
-- Behaviour differs slightly by platform: Windows negotiates TLS 1.2 (SChannel needs the newer
-  `SCH_CREDENTIALS` for 1.3); Linux and macOS negotiate 1.2 or 1.3.
+- TLS 1.3 everywhere the OS supports it. On Windows that needs `SCH_CREDENTIALS` (Windows 10
+  1809 and later; 1.3 itself on Windows 11 / Server 2022), with `TLS_PARAMETERS` disabling
+  everything below 1.2. Older Windows rejects that structure, and dtop falls back to
+  `SCHANNEL_CRED` (TLS 1.2). TLS 1.3 session tickets arrive as `SEC_I_RENEGOTIATE` from
+  `DecryptMessage` and are fed back to `InitializeSecurityContext`. Every backend reports the
+  negotiated version, and CI asserts 1.3 against a 1.3-only server on all three OSes.
 - macOS relies on `SecIdentityCreate`, which is exported but undocumented. If a future macOS drops
   it, dtop reports that client certificates from files are unavailable; server-only TLS keeps
   working.

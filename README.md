@@ -151,7 +151,7 @@ TLS runs on each platform's own stack, with no extra dependencies:
 | --- | --- | --- |
 | Linux | OpenSSL 1.1.1 or 3.x, loaded at runtime | `libssl` must be installed (it is on virtually every distribution) |
 | macOS | Network.framework | Client certificates are used from the PEM files in memory; nothing goes into the keychain |
-| Windows | SChannel (TLS 1.2) | Client keys are imported into your CNG key store for the session and deleted when dtop exits |
+| Windows | SChannel | TLS 1.3 on Windows 11 and Server 2022, else 1.2 (Windows before 10 1809 is limited to 1.2). Client keys are imported into your CNG key store for the session and deleted when dtop exits |
 
 ### Docker contexts
 
@@ -370,7 +370,7 @@ supported yet, — = not applicable.
 | Connect over a Unix socket | ✓ | ✓ | — | unit · real-socket test (macOS/Linux CI) · integration · e2e |
 | Connect over a named pipe (Docker Desktop) | — | — | ✓ | unit (Windows CI) |
 | Connect over plain-HTTP `tcp://` | ✓ | ✓ | ✓ | unit (Winsock connect/failure on Windows CI) · e2e |
-| TLS (`--tlsverify`, `--tls`, `https://`, client certificates) | ✓ ⁶ | ✓ ⁶ | ✓ ⁶ | real handshakes against `openssl s_server` on all three CI runners · `--once` against a `--tlsverify` docker:dind daemon (Linux CI) · e2e |
+| TLS 1.2 and 1.3 (`--tlsverify`, `--tls`, `https://`, client certificates) | ✓ ⁶ | ✓ ⁶ | ✓ ⁶ | real handshakes against `openssl s_server` on all three CI runners, including TLS 1.3-only and 1.2-only servers · `--once` against a `--tlsverify` docker:dind daemon (Linux CI) · e2e |
 | `ssh://` endpoints | ✗ | ✗ | ✗ | forward the socket first (see above) |
 | Endpoint discovery (`DOCKER_HOST`, Docker contexts, well-known sockets) | ✓ | ✓ | ✓ | unit (contexts laid out as the Docker CLI writes them) |
 | Several hosts at once (chips, `[` `]`, host list, `--once` sections) | ✓ | ✓ | ✓ | unit · e2e (local socket + TLS daemon) · CI `--once` with two daemons |
@@ -412,12 +412,13 @@ GPU notes:
 4. Per-container attribution only works when dtop runs on the Docker host itself (same PID
    namespace). It does not work when dtop connects to a remote daemon.
 5. None of this has been tested on real GPU hardware yet; this environment has no GPU.
-6. Linux uses OpenSSL (loaded at runtime), macOS Network.framework, Windows SChannel (TLS 1.2).
+6. Linux uses OpenSSL (loaded at runtime), macOS Network.framework, Windows SChannel. All three
+   negotiate TLS 1.3 where the OS supports it (Windows 11 / Server 2022) and fall back to 1.2.
    See [ADR 0003](.github/plans/0003-tls-on-platform-stacks.md).
 
 What the verification labels mean:
 
-- **unit**: the 522-test suite, run in CI on all three platforms (TLS tests included, against a real `openssl s_server`).
+- **unit**: the 524-test suite (525 on Windows), run in CI on all three platforms (TLS tests included, against a real `openssl s_server`).
 - **integration**: tests against a real Docker daemon on the Linux CI runner.
 - **e2e**: the real app driven in a pseudo-terminal against live daemons (including a `--tlsverify` docker:dind daemon for multi-host and TLS log streaming): real key and mouse input, with the rendered screen checked cell by cell. So far this has only been run on Linux.
 
