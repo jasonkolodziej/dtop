@@ -48,6 +48,17 @@ public struct TLSTransport: DockerTransport {
     }
 }
 
+/// A negotiated TLS protocol version.
+public enum TLSProtocolVersion: String, Sendable, Equatable {
+    case tls12 = "TLS 1.2"
+    case tls13 = "TLS 1.3"
+}
+
+/// Implemented by the TLS connections, so callers (and tests) can see what was negotiated.
+public protocol TLSSessionInfo: AnyObject {
+    var negotiatedProtocol: TLSProtocolVersion? { get }
+}
+
 extension TransportFactory {
     /// Builds the transport for a host: TLS when the host has TLS settings, otherwise the
     /// endpoint's plain transport.

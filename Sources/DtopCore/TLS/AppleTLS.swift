@@ -10,7 +10,7 @@ import Security
 ///   name, anchored to `--tlscacert` when given (only that CA is trusted), else the system roots.
 /// - Client certificates: the PEM certificate and key become a `SecIdentity` in memory; nothing
 ///   is written to the keychain.
-final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
+final class AppleTLSConnection: DockerConnection, TLSSessionInfo, @unchecked Sendable {
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "dtop.tls")
     private let timeoutSeconds: Int
@@ -18,6 +18,7 @@ final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
     private let endpoint: String
     private let serverName: String
     private let state = ConnectionState()
+    private(set) var negotiatedProtocol: TLSProtocolVersion?
 
     /// Mutable state shared with Network.framework's callbacks.
     private final class ConnectionState: @unchecked Sendable {
@@ -135,6 +136,13 @@ final class AppleTLSConnection: DockerConnection, @unchecked Sendable {
             connection.stateUpdateHandler = nil
             connection.cancel()
             throw describe(error, duringHandshake: true)
+        }
+        if let metadata = connection.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata {
+            switch sec_protocol_metadata_get_negotiated_tls_protocol_version(metadata.securityProtocolMetadata) {
+            case .TLSv13: negotiatedProtocol = .tls13
+            case .TLSv12: negotiatedProtocol = .tls12
+            default: negotiatedProtocol = nil
+            }
         }
         // Keep watching: a daemon that rejects our certificate fails the connection after `.ready`.
         let watched = self.state

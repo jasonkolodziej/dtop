@@ -125,7 +125,11 @@ final class SSPILibrary: @unchecked Sendable {
     // sspi.h / schannel.h / ncrypt.h constants.
     static let credentialsOutbound: UInt32 = 2
     static let schannelCredVersion: UInt32 = 4
+    static let schCredentialsVersion: UInt32 = 5
     static let protocolTLS12Client: UInt32 = 0x0000_0800
+    static let protocolTLS13Client: UInt32 = 0x0000_2000
+    /// SSL 2, SSL 3, TLS 1.0 and TLS 1.1 (client): what SCH_CREDENTIALS disables, leaving 1.2 and 1.3.
+    static let protocolsBelowTLS12Client: UInt32 = 0x0000_0008 | 0x0000_0020 | 0x0000_0080 | 0x0000_0200
     static let credManualValidation: UInt32 = 0x0000_0008
     static let credNoDefaultCredentials: UInt32 = 0x0000_0010
     static let useStrongCrypto: UInt32 = 0x0040_0000
@@ -139,6 +143,7 @@ final class SSPILibrary: @unchecked Sendable {
     static let bufferStreamHeader: UInt32 = 7
     static let attributeStreamSizes: UInt32 = 4
     static let attributeRemoteCertificate: UInt32 = 0x53
+    static let attributeConnectionInfo: UInt32 = 0x5A
     static let ok: Int32 = 0
     static let continueNeeded = Int32(bitPattern: 0x0009_0312)
     static let incompleteCredentials = Int32(bitPattern: 0x0009_0320)
@@ -172,7 +177,19 @@ final class SSPILibrary: @unchecked Sendable {
 /// imported into CNG) and the credentials handle. Built once per configuration and shared by
 /// every connection, because dtop opens a new connection per request.
 final class SChannelCredentials: @unchecked Sendable {
+    /// How the credentials were acquired. `SCH_CREDENTIALS` (Windows 10 1809 / Server 2019 and
+    /// later) is required for TLS 1.3, which Windows 11 and Server 2022 negotiate; older systems
+    /// only accept `SCHANNEL_CRED`, which stops at TLS 1.2.
+    enum Style: Sendable, Equatable {
+        case modern
+        case legacy
+    }
+
     let handle = RawStruct(size: 16) // CredHandle
+    private(set) var style: Style = .legacy
+
+    /// Tests set this to exercise the `SCHANNEL_CRED` fallback on systems that support both.
+    nonisolated(unsafe) static var forceLegacyCredentials = false
     private var certificate: PCCERT_CONTEXT?
     private var keyHandle: UInt = 0
 
@@ -181,7 +198,8 @@ final class SChannelCredentials: @unchecked Sendable {
     nonisolated(unsafe) private static var registeredCleanup = false
 
     static func shared(for configuration: TLSConfiguration, library: SSPILibrary) throws -> SChannelCredentials {
-        let key = [configuration.certificateFile ?? "", configuration.keyFile ?? ""].joined(separator: "\u{0}")
+        let key = [configuration.certificateFile ?? "", configuration.keyFile ?? "",
+                   forceLegacyCredentials ? "legacy" : "modern"].joined(separator: "\u{0}")
         lock.lock()
         defer { lock.unlock() }
         if let cached = cache[key] { return cached }
@@ -209,24 +227,67 @@ final class SChannelCredentials: @unchecked Sendable {
         if let certificateFile = configuration.certificateFile, let keyFile = configuration.keyFile {
             try loadClientCertificate(certificateFile: certificateFile, keyFile: keyFile)
         }
-        let credential = RawStruct(size: 80) // SCHANNEL_CRED (64-bit layout)
-        credential.set(0, SSPILibrary.schannelCredVersion)
+        let flags = SSPILibrary.credManualValidation | SSPILibrary.credNoDefaultCredentials | SSPILibrary.useStrongCrypto
         var certificates = [certificate]
-        try certificates.withUnsafeMutableBufferPointer { array in
-            if certificate != nil {
-                credential.set(4, UInt32(1))
-                credential.set(8, UnsafeMutableRawPointer(array.baseAddress))
+        let hasCertificate = certificate != nil
+        let handle = self.handle
+        style = try certificates.withUnsafeMutableBufferPointer { array -> Style in
+            let chain = hasCertificate ? UnsafeMutableRawPointer(array.baseAddress) : nil
+            if !Self.forceLegacyCredentials {
+                let status = Self.acquireModern(library: library, handle: handle, certificates: chain, flags: flags)
+                if status == SSPILibrary.ok {
+                    TLSSupport.trace("credentials: SCH_CREDENTIALS (TLS 1.2 and 1.3)")
+                    return .modern
+                }
+                TLSSupport.trace("credentials: SCH_CREDENTIALS refused (\(SSPILibrary.describe(status))); "
+                    + "falling back to SCHANNEL_CRED (TLS 1.2)")
             }
-            credential.set(56, SSPILibrary.protocolTLS12Client)
-            credential.set(72, SSPILibrary.credManualValidation | SSPILibrary.credNoDefaultCredentials | SSPILibrary.useStrongCrypto)
-            var provider = SSPILibrary.unifiedProvider.wideCString
-            let status = provider.withUnsafeMutableBufferPointer { name in
-                library.acquireCredentials(nil, name.baseAddress, SSPILibrary.credentialsOutbound, nil, credential.pointer,
-                                           nil, nil, handle.pointer, nil)
-            }
+            let status = Self.acquireLegacy(library: library, handle: handle, certificates: chain, flags: flags)
             guard status == SSPILibrary.ok else {
                 throw DockerError.tls("Windows could not set up TLS credentials: \(SSPILibrary.describe(status))")
             }
+            TLSSupport.trace("credentials: SCHANNEL_CRED (TLS 1.2)")
+            return .legacy
+        }
+    }
+
+    /// `SCH_CREDENTIALS` (64-bit layout, 72 bytes) with one `TLS_PARAMETERS` (40 bytes) that
+    /// disables everything older than TLS 1.2, so SChannel may negotiate 1.2 or 1.3.
+    private static func acquireModern(library: SSPILibrary, handle: RawStruct, certificates: UnsafeMutableRawPointer?,
+                                      flags: UInt32) -> Int32 {
+        let parameters = RawStruct(size: 40)
+        parameters.set(16, SSPILibrary.protocolsBelowTLS12Client) // grbitDisabledProtocols
+        let credential = RawStruct(size: 72)
+        credential.set(0, SSPILibrary.schCredentialsVersion)
+        if let certificates {
+            credential.set(8, UInt32(1)) // cCreds
+            credential.set(16, certificates) // paCred
+        }
+        credential.set(52, flags) // dwFlags
+        credential.set(56, UInt32(1)) // cTlsParameters
+        credential.set(64, parameters.pointer) // pTlsParameters
+        return acquire(library: library, handle: handle, credential: credential)
+    }
+
+    /// `SCHANNEL_CRED` (64-bit layout, 80 bytes), limited to TLS 1.2.
+    private static func acquireLegacy(library: SSPILibrary, handle: RawStruct, certificates: UnsafeMutableRawPointer?,
+                                      flags: UInt32) -> Int32 {
+        let credential = RawStruct(size: 80)
+        credential.set(0, SSPILibrary.schannelCredVersion)
+        if let certificates {
+            credential.set(4, UInt32(1)) // cCreds
+            credential.set(8, certificates) // paCred
+        }
+        credential.set(56, SSPILibrary.protocolTLS12Client) // grbitEnabledProtocols
+        credential.set(72, flags) // dwFlags
+        return acquire(library: library, handle: handle, credential: credential)
+    }
+
+    private static func acquire(library: SSPILibrary, handle: RawStruct, credential: RawStruct) -> Int32 {
+        var provider = SSPILibrary.unifiedProvider.wideCString
+        return provider.withUnsafeMutableBufferPointer { name in
+            library.acquireCredentials(nil, name.baseAddress, SSPILibrary.credentialsOutbound, nil, credential.pointer,
+                                       nil, nil, handle.pointer, nil)
         }
     }
 
@@ -294,7 +355,7 @@ final class SChannelCredentials: @unchecked Sendable {
 }
 
 /// A TLS client session over a Winsock connection, through SChannel.
-final class SChannelConnection: DockerConnection, @unchecked Sendable {
+final class SChannelConnection: DockerConnection, TLSSessionInfo, @unchecked Sendable {
     private let library: SSPILibrary
     private let underlying: any DockerConnection
     private let credentials: SChannelCredentials
@@ -309,6 +370,7 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
     private var isClosed = false
     /// The server sent close_notify: the stream is over, whatever the socket does.
     private var peerClosed = false
+    private(set) var negotiatedProtocol: TLSProtocolVersion?
     private var encrypted: [UInt8] = []
     private var plaintext: [UInt8] = []
     private var header = 0
@@ -419,6 +481,17 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
         header = Int(sizes.uint32(0))
         trailer = Int(sizes.uint32(4))
         maximumMessage = max(1, Int(sizes.uint32(8)))
+        // SecPkgContext_ConnectionInfo: dwProtocol is its first DWORD.
+        let info = RawStruct(size: 32)
+        if library.queryAttributes(context.pointer, SSPILibrary.attributeConnectionInfo, info.pointer) == SSPILibrary.ok {
+            let protocolBits = info.uint32(0)
+            if protocolBits & SSPILibrary.protocolTLS13Client != 0 {
+                negotiatedProtocol = .tls13
+            } else if protocolBits & SSPILibrary.protocolTLS12Client != 0 {
+                negotiatedProtocol = .tls12
+            }
+            TLSSupport.trace("negotiated protocol bits 0x\(String(protocolBits, radix: 16)) (\(credentials.style))")
+        }
         TLSSupport.trace("stream sizes: header=\(header) trailer=\(trailer) max=\(maximumMessage) leftover=\(encrypted.count)")
     }
 
@@ -579,9 +652,10 @@ final class SChannelConnection: DockerConnection, @unchecked Sendable {
                     peerClosed = true
                     continue
                 case SSPILibrary.renegotiate:
-                    // Post-handshake messages (TLS 1.3 tickets, key updates): feed them back.
+                    // TLS 1.3 post-handshake messages (session tickets, key updates) come back as
+                    // SEC_I_RENEGOTIATE; SChannel wants their bytes fed to InitializeSecurityContext.
                     encrypted = extra
-                    try handshakeContinuation()
+                    if !encrypted.isEmpty { try handshakeContinuation() }
                     continue
                 case SSPILibrary.incompleteMessage:
                     break

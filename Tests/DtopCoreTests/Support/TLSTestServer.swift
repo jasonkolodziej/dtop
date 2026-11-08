@@ -143,7 +143,9 @@ final class OpenSSLServer: @unchecked Sendable {
     let port: Int
     private let process: Process
 
-    init(pki: TLSTestPKI, certificate: String = "server.pem", key: String = "server.key", requireClientCertificate: Bool) throws {
+    /// - Parameter extraArguments: more `s_server` flags, e.g. `-tls1_3` to allow only TLS 1.3.
+    init(pki: TLSTestPKI, certificate: String = "server.pem", key: String = "server.key", requireClientCertificate: Bool,
+         extraArguments: [String] = []) throws {
         var lastError = "s_server did not start"
         for attempt in 0..<6 {
             // First let OpenSSL pick a free port (OpenSSL 3 reports it); LibreSSL may not report
@@ -154,6 +156,7 @@ final class OpenSSLServer: @unchecked Sendable {
             if requireClientCertificate {
                 arguments += ["-CAfile", pki.path("ca.pem"), "-Verify", "1", "-verify_return_error"]
             }
+            arguments += extraArguments
             let process = Process()
             process.executableURL = URL(fileURLWithPath: OpenSSLTool.path ?? "openssl")
             process.arguments = arguments

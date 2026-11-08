@@ -30,6 +30,7 @@ final class OpenSSLLibrary: @unchecked Sendable {
     typealias ErrGet = @convention(c) () -> UInt
     typealias ErrString = @convention(c) (UInt, UnsafeMutablePointer<CChar>?, Int) -> Void
     typealias ErrClear = @convention(c) () -> Void
+    typealias Version = @convention(c) (OpaquePointer?) -> Int32
 
     let clientMethod: Method
     let ctxNew: CTXNew
@@ -64,6 +65,7 @@ final class OpenSSLLibrary: @unchecked Sendable {
     let errGetError: ErrGet
     let errErrorString: ErrString
     let errClearError: ErrClear
+    let sslVersion: Version
 
     /// The shared library, loaded once. Fails with an actionable error when libssl is missing.
     static let shared: Result<OpenSSLLibrary, any Error> = Result { try OpenSSLLibrary() }
@@ -118,6 +120,7 @@ final class OpenSSLLibrary: @unchecked Sendable {
         errGetError = try symbol("ERR_get_error", as: ErrGet.self)
         errErrorString = try symbol("ERR_error_string_n", as: ErrString.self)
         errClearError = try symbol("ERR_clear_error", as: ErrClear.self)
+        sslVersion = try symbol("SSL_version", as: Version.self)
     }
 
     private static func open(_ names: [String]) -> UnsafeMutableRawPointer? {
@@ -159,7 +162,7 @@ final class OpenSSLLibrary: @unchecked Sendable {
 
 /// A TLS client session over an existing connection, using memory BIOs so OpenSSL never touches
 /// the socket: dtop's transport keeps doing the I/O (timeouts and `interrupt()` keep working).
-final class OpenSSLConnection: DockerConnection, @unchecked Sendable {
+final class OpenSSLConnection: DockerConnection, TLSSessionInfo, @unchecked Sendable {
     private let library: OpenSSLLibrary
     private let underlying: any DockerConnection
     private let context: OpaquePointer
@@ -172,6 +175,7 @@ final class OpenSSLConnection: DockerConnection, @unchecked Sendable {
     private var isClosed = false
     private let configuration: TLSConfiguration
     private let endpoint: String
+    private(set) var negotiatedProtocol: TLSProtocolVersion?
 
     init(underlying: any DockerConnection, configuration: TLSConfiguration, serverName: String, endpoint: String) throws {
         let library = try OpenSSLLibrary.load()
@@ -275,7 +279,15 @@ final class OpenSSLConnection: DockerConnection, @unchecked Sendable {
         while true {
             let result = library.sslDoHandshake(ssl)
             try flushOutput()
-            if result == 1 { return }
+            if result == 1 {
+                switch library.sslVersion(ssl) {
+                case 0x0304: negotiatedProtocol = .tls13
+                case 0x0303: negotiatedProtocol = .tls12
+                default: negotiatedProtocol = nil
+                }
+                TLSSupport.trace("openssl: negotiated \(negotiatedProtocol?.rawValue ?? "an older protocol")")
+                return
+            }
             switch library.sslGetError(ssl, result) {
             case OpenSSLLibrary.errorWantRead:
                 let bytes = try underlying.read(maxLength: 16 * 1024)

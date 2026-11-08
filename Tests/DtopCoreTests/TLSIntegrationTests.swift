@@ -88,6 +88,55 @@ struct TLSIntegrationTests {
         }
     }
 
+    /// Makes one request and returns the status with the TLS version the connection negotiated.
+    func versionedGet(_ transport: TLSTransport) throws -> (Int, TLSProtocolVersion?) {
+        final class Seen: @unchecked Sendable { var version: TLSProtocolVersion? }
+        let seen = Seen()
+        var status = 0
+        try HTTPClient(transport: transport).stream(
+            HTTPRequest(method: .get, target: "/_ping"),
+            onConnect: { seen.version = ($0 as? TLSSessionInfo)?.negotiatedProtocol },
+            onHead: { status = $0.status },
+            onBody: { _ in true }
+        )
+        return (status, seen.version)
+    }
+
+    @Test("TLS 1.3 is negotiated when the daemon speaks it, client certificate included")
+    func tls13() throws {
+        let pki = try pki()
+        let server = try OpenSSLServer(pki: pki, requireClientCertificate: true, extraArguments: ["-tls1_3"])
+        for key in ["client-ec", "client-rsa"] {
+            let (status, version) = try versionedGet(transport(server, clientConfiguration(pki, key: key)))
+            #expect(status == 200)
+            #expect(version == .tls13, "\(key)")
+        }
+    }
+
+    @Test("daemons limited to TLS 1.2 still work")
+    func tls12() throws {
+        let pki = try pki()
+        let server = try OpenSSLServer(pki: pki, requireClientCertificate: true, extraArguments: ["-tls1_2"])
+        let (status, version) = try versionedGet(transport(server, clientConfiguration(pki)))
+        #expect(status == 200)
+        #expect(version == .tls12)
+    }
+
+    #if os(Windows)
+    @Test("Windows: the SCHANNEL_CRED fallback (pre-1809) speaks TLS 1.2 and cannot reach a TLS 1.3-only daemon")
+    func legacyCredentials() throws {
+        let pki = try pki()
+        SChannelCredentials.forceLegacyCredentials = true
+        defer { SChannelCredentials.forceLegacyCredentials = false }
+        let modern = try OpenSSLServer(pki: pki, requireClientCertificate: true, extraArguments: ["-tls1_2"])
+        let (status, version) = try versionedGet(transport(modern, clientConfiguration(pki)))
+        #expect(status == 200)
+        #expect(version == .tls12)
+        let tls13Only = try OpenSSLServer(pki: pki, requireClientCertificate: true, extraArguments: ["-tls1_3"])
+        #expect(throws: (any Error).self) { _ = try versionedGet(transport(tls13Only, clientConfiguration(pki))) }
+    }
+    #endif
+
     @Test("a certificate for another name is rejected")
     func nameMismatch() throws {
         let pki = try pki()
