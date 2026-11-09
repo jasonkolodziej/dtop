@@ -1,0 +1,24 @@
+{
+  "configurations": [
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:dtop}",
+      "name": "Debug dtop",
+      "target": "dtop",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug dtop"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:dtop}",
+      "name": "Release dtop",
+      "target": "dtop",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release dtop"
+    }
+  ]
+}
