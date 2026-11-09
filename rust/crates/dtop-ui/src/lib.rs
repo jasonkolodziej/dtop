@@ -2,6 +2,8 @@
 //! renderer, layout, widgets, themes, an input parser and terminal I/O. It does not depend on
 //! `dtop-core`.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod buffer;
 mod builtin_themes;
 pub mod color;

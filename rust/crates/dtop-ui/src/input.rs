@@ -218,7 +218,7 @@ impl InputParser {
             return events;
         }
         if let Some(mut paste) = self.paste.take() {
-            paste.extend(self.buffer.drain(..));
+            paste.append(&mut self.buffer);
             events.push(InputEvent::Paste(
                 String::from_utf8_lossy(&paste).into_owned(),
             ));

@@ -177,6 +177,11 @@ impl HostRequest {
     }
 }
 
+/// Reads a file's text (None when missing or unreadable).
+pub type ReadFile = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// Lists a directory's entry names (empty when missing).
+pub type ListDirectory = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
+
 /// What the resolver may look at, injected so resolution is testable.
 #[derive(Clone)]
 pub struct HostEnvironment {
@@ -184,8 +189,8 @@ pub struct HostEnvironment {
     pub platform: Platform,
     pub home_directory: Option<String>,
     pub file_exists: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    pub read_file: Arc<dyn Fn(&str) -> Option<String> + Send + Sync>,
-    pub list_directory: Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>,
+    pub read_file: ReadFile,
+    pub list_directory: ListDirectory,
 }
 
 impl HostEnvironment {

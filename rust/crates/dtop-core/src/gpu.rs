@@ -1152,7 +1152,7 @@ mod tests {
         assert_eq!(first.device_memory(), 16 * 1_048_576);
         assert!(tracker.update(&[first], 0.0).is_empty());
         let second = DrmClient::parse(&text(1_500_000_000)).unwrap();
-        let usage = tracker.update(&[second.clone()], 1.0);
+        let usage = tracker.update(std::slice::from_ref(&second), 1.0);
         assert!((usage[&second.key()].busiest() - 50.0).abs() < 1e-9);
         assert_eq!(
             DrmUsageTracker::device_utilization(&[
@@ -1171,7 +1171,7 @@ mod tests {
         let mut tracker = DrmUsageTracker::default();
         tracker.update(&[DrmClient::parse(&text(0, 1000)).unwrap()], 0.0);
         let c = DrmClient::parse(&text(250, 2000)).unwrap();
-        let usage = tracker.update(&[c.clone()], 1.0);
+        let usage = tracker.update(std::slice::from_ref(&c), 1.0);
         assert!((usage[&c.key()].busiest() - 25.0).abs() < 1e-9);
     }
 

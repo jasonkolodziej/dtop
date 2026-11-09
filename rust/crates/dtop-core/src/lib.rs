@@ -2,6 +2,8 @@
 //! models, metrics math, GPU collectors and compose support for dtop. Only `std` and the
 //! platform C libraries (ADR 0001, ADR 0004).
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod api;
 pub mod client;
 pub mod compose;
@@ -21,7 +23,9 @@ pub mod timestamp;
 pub mod tls;
 pub mod transport;
 
-pub use api::{ApiVersion, ContainerAction, DockerApi, StreamItem, Subscription};
+pub use api::{
+    ApiVersion, ContainerAction, DockerApi, StreamCancellation, StreamItem, Subscription,
+};
 pub use client::DockerClient;
 pub use endpoint::DockerEndpoint;
 pub use error::{DockerError, Result};
