@@ -125,23 +125,24 @@ The Rust port and terminal UI choice are recorded in [ADR 0004](.github/plans/00
 - 🚧 Phase 5: reconnect and backoff, SIGTERM/SIGHUP handling, terminal restoration, too-small
   fallback, bounded stats workers and explicit worker-failure reporting are implemented. The Rust
   workflow configures the 3-OS matrix, required TLS tests, 512 KB Linux stack tests, Rust 1.81
-  checks, and real-daemon and pseudo-terminal integration tests. Native Windows and real terminal
-  and GPU-hardware checks still need the environments listed below.
+  checks, and real-daemon and pseudo-terminal integration tests. Native Windows tests pass;
+  real terminal and GPU-hardware checks still need the environments listed below.
 - 🚧 Phase 6: TLS host resolution and context overrides, several hosts, host list and chips,
   host-scoped actions and Compose commands, and live log streaming with `LogStreamPolicy` are
   implemented. TLS backends:
   - ✅ macOS, through Network.framework with hand-built Objective-C blocks; the client identity is
     built in memory
   - ✅ Linux, through OpenSSL loaded with `dlopen`, using memory BIOs over dtop's own socket
-  - 🚧 Windows, SChannel (`SCH_CREDENTIALS` with fallback to `SCHANNEL_CRED`, CNG key import,
-    exclusive-root validation, TLS 1.3 tickets through `SEC_I_RENEGOTIATE`): Windows-target Clippy
-    and compilation pass; native execution and the forced legacy-path handshake await Windows CI
+  - ✅ Windows, SChannel (`SCH_CREDENTIALS` with fallback to `SCHANNEL_CRED`, CNG key import,
+    exclusive-root validation, TLS 1.3 tickets through `SEC_I_RENEGOTIATE`): native Windows CI
+    passes the real TLS handshakes, including a forced legacy-credential handshake
 
 ### Verified so far
-- The Rust workspace suite and required real-handshake TLS tests pass on macOS and Linux
-  (`rust:1.85-bookworm`, OpenSSL 3.0.15), including the Linux 512 KB stack run. TLS tests cover
-  EC/RSA client keys, TLS 1.2/1.3, server names and certificate failures. macOS enforces its
-  `serverAuth` certificate-usage requirement rather than bypassing verification.
+- The Rust workspace suite and required real-handshake TLS tests pass on macOS, Linux
+  (`rust:1.85-bookworm`, OpenSSL 3.0.15) and native Windows Server 2022, including the Linux
+  512 KB stack run and Windows's forced legacy SChannel handshake. TLS tests cover EC/RSA client
+  keys, TLS 1.2/1.3, server names and certificate failures. macOS enforces its `serverAuth`
+  certificate-usage requirement rather than bypassing verification.
 - Real-daemon integration tests pass against Docker Desktop and a mutual-TLS Docker-in-Docker
   daemon. Automated pseudo-terminal tests cover two hosts, live log pause/resume, mouse switching,
   theme save/discard and SIGTERM restoration against both. A separate two-daemon test switches
@@ -155,8 +156,9 @@ The Rust port and terminal UI choice are recorded in [ADR 0004](.github/plans/00
   also covered graphs, tabs, Compose, filtering, help, processes and confirmations.
 
 ### Not done yet
-- The new Rust CI workflow has not yet run on a native Windows runner. Windows named-pipe,
-  SChannel and forced legacy-credential handshakes, plus real pre-1809 behavior, remain unverified.
+- Windows named-pipe integration and real pre-1809 SChannel behavior remain unverified. The first
+  Rust CI run passed the macOS and Windows jobs but failed Linux's two-daemon setup; its Docker
+  context environment has been corrected and needs a fresh CI run.
 - Interactive testing in real macOS and Windows terminal applications and GPU tests on real
   NVIDIA, AMD and Intel hardware remain outstanding. Broader profiling on heterogeneous,
   production-scale hosts and Windows is still useful beyond the isolated 120-container run.

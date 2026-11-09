@@ -157,7 +157,13 @@ jobs:
           DOCKER_TLS_VERIFY: "1"
           DOCKER_CERT_PATH: ${{ runner.temp }}/dind-certs/client
         run: |
-          export DTOP_SECONDARY_HOST="$(docker context inspect --format '{{.Endpoints.docker.Host}}')"
+          local_endpoint="$(env -u DOCKER_HOST -u DOCKER_TLS -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH \
+            docker context inspect --format '{{.Endpoints.docker.Host}}')"
+          case "$local_endpoint" in
+            unix://*) ;;
+            *) echo "Expected a local Docker socket, got: $local_endpoint" >&2; exit 1 ;;
+          esac
+          export DTOP_SECONDARY_HOST="$local_endpoint"
           export DOCKER_HOST="tcp://localhost:$DTOP_DIND_PORT"
           cargo +stable test --locked -p dtop-core --test integration
           cargo +stable test --locked -p dtop --test interactive
