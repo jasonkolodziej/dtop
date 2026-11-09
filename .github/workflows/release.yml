@@ -1,0 +1,226 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, for example 0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Derive version and tag
+        id: meta
+        shell: bash
+        env:
+          MANUAL_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            TAG="${GITHUB_REF_NAME}"
+          else
+            VERSION="${MANUAL_VERSION#v}"
+            TAG="v${VERSION}"
+          fi
+
+          if [[ -z "${VERSION}" ]]; then
+            echo "A semantic-version value is required."
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    name: Build Linux release
+    needs: prepare
+    runs-on: ubuntu-24.04
+    env:
+      DTOP_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Stamp version into the build
+        shell: bash
+        run: |
+          cat > Sources/DtopApp/GeneratedVersion.swift <<EOF
+          import Foundation
+
+          enum BuildVersion {
+              static let current = "${DTOP_VERSION}"
+          }
+          EOF
+
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+
+      - name: Build release binary
+        run: swift build -c release
+
+      - name: Package Linux archive
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp .build/release/dtop dist/dtop
+          tar -czf "dist/dtop-${DTOP_VERSION}-linux-x86_64.tar.gz" -C dist dtop
+          sha256sum "dist/dtop-${DTOP_VERSION}-linux-x86_64.tar.gz" | tee "dist/dtop-${DTOP_VERSION}-linux-x86_64.tar.gz.sha256"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtop-linux
+          path: dist/*
+
+  build-macos:
+    name: Build macOS release
+    needs: prepare
+    runs-on: macos-15
+    env:
+      DTOP_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Stamp version into the build
+        shell: bash
+        run: |
+          cat > Sources/DtopApp/GeneratedVersion.swift <<EOF
+          import Foundation
+
+          enum BuildVersion {
+              static let current = "${DTOP_VERSION}"
+          }
+          EOF
+
+      - name: Build release binary
+        run: swift build -c release
+
+      - name: Package macOS archive
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp .build/release/dtop dist/dtop
+          tar -czf "dist/dtop-${DTOP_VERSION}-macos-arm64.tar.gz" -C dist dtop
+          shasum -a 256 "dist/dtop-${DTOP_VERSION}-macos-arm64.tar.gz" | tee "dist/dtop-${DTOP_VERSION}-macos-arm64.tar.gz.sha256"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtop-macos
+          path: dist/*
+
+  build-windows:
+    name: Build Windows release
+    needs: prepare
+    runs-on: windows-2022
+    env:
+      DTOP_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Stamp version into the build
+        shell: bash
+        run: |
+          cat > Sources/DtopApp/GeneratedVersion.swift <<EOF
+          import Foundation
+
+          enum BuildVersion {
+              static let current = "${DTOP_VERSION}"
+          }
+          EOF
+
+      - name: Set up Swift
+        uses: compnerd/gha-setup-swift@57fe462cd3c7b05ae8fcff79b00719312e305257
+        with:
+          branch: swift-6.2-release
+          tag: 6.2-RELEASE
+
+      - name: Build release binary
+        shell: bash
+        run: swift build -c release
+
+      - name: Package Windows archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item .build\release\dtop.exe dist\dtop.exe
+          Compress-Archive -Path dist\dtop.exe -DestinationPath "dist\dtop-${env:DTOP_VERSION}-windows-x86_64.zip" -Force
+          (Get-FileHash "dist\dtop-${env:DTOP_VERSION}-windows-x86_64.zip" -Algorithm SHA256).Hash + "  dtop-${env:DTOP_VERSION}-windows-x86_64.zip" | Set-Content -Path "dist\dtop-${env:DTOP_VERSION}-windows-x86_64.zip.sha256"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtop-windows
+          path: dist/*
+
+  release:
+    name: Sign and publish GitHub release
+    needs:
+      - prepare
+      - build-linux
+      - build-macos
+      - build-windows
+    runs-on: ubuntu-24.04
+    env:
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+      VERSION_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Import GPG key for signing
+        if: ${{ env.GPG_PRIVATE_KEY != '' && env.GPG_PASSPHRASE != '' }}
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gnupg"
+          chmod 700 "$HOME/.gnupg"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          KEY_ID="${GPG_KEY_ID:-$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')}"
+          echo "GPG_SIGNING_KEY=${KEY_ID}" >> "$GITHUB_ENV"
+
+      - name: Sign artifacts
+        if: ${{ env.GPG_PRIVATE_KEY != '' && env.GPG_PASSPHRASE != '' }}
+        shell: bash
+        run: |
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 | while IFS= read -r -d '' file; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$GPG_SIGNING_KEY" --armor --detach-sign "$file"
+          done
+
+      - name: Aggregate checksum manifest
+        shell: bash
+        run: |
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 | xargs -0 sha256sum > dist/checksums.txt
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION_TAG }}
+          name: dtop ${{ env.VERSION_TAG }}
+          generate_release_notes: true
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.zip
+            dist/**/*.sha256
+            dist/**/*.asc
+            dist/checksums.txt

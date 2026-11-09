@@ -77,6 +77,34 @@ swift build -c release
 .build/release/dtop
 ```
 
+For release builds, the project follows semantic-version tags like `v0.1.0`. The GitHub release
+workflow stamps each build with the tag, produces archives for the supported platforms, signs the
+artifacts, and publishes a GitHub Release with checksums.
+
+### Release process
+
+To make a tag and a local proof build on the current platform:
+
+```bash
+./scripts/release.sh 0.1.0 --tag
+```
+
+To build and sign the archive locally before pushing the tag:
+
+```bash
+./scripts/release.sh 0.1.0 --sign
+```
+
+To create and push the annotated release tag:
+
+```bash
+./scripts/release.sh 0.1.0 --tag --push
+```
+
+The GitHub Actions workflow in `.github/workflows/release.yml` performs the same version stamping,
+platform builds, GPG signing, checksum generation, and GitHub Release upload automatically for
+`v*.*.*` tags.
+
 dtop finds Docker the way the Docker CLI does:
 
 1. `--host` or `--context` (both repeatable, for several hosts)
