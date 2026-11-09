@@ -52,6 +52,11 @@ impl ShutdownStream for std::net::TcpStream {
     }
     fn shutdown_both(&self) {
         let _ = self.shutdown(std::net::Shutdown::Both);
+        // On Windows, shutdown() does not wake a thread already blocked in recv() while the
+        // peer stays silent (a followed log with no output). Cancelling the socket's pending
+        // I/O does; reads issued afterwards see the shutdown and return at once.
+        #[cfg(windows)]
+        cancel_pending_socket_io(self);
     }
     fn clear_read_timeout(&self) -> io::Result<()> {
         self.set_read_timeout(None)
@@ -75,9 +80,19 @@ impl ShutdownStream for std::os::unix::net::UnixStream {
     }
 }
 
+#[cfg(windows)]
+fn cancel_pending_socket_io(stream: &std::net::TcpStream) {
+    use std::os::windows::io::AsRawSocket;
+    // A SOCKET is a kernel handle.
+    windows_pipe::cancel_all_io(stream.as_raw_socket() as usize as std::os::windows::io::RawHandle);
+}
+
 pub(crate) struct StreamConnection<S: ShutdownStream> {
     stream: S,
     closed: AtomicBool,
+    /// Set by `interrupt`, so a read it cut short (EINTR, or a cancelled Windows recv) returns
+    /// instead of being retried.
+    interrupted: AtomicBool,
 }
 
 impl<S: ShutdownStream> StreamConnection<S> {
@@ -85,6 +100,7 @@ impl<S: ShutdownStream> StreamConnection<S> {
         StreamConnection {
             stream,
             closed: AtomicBool::new(false),
+            interrupted: AtomicBool::new(false),
         }
     }
 
@@ -141,14 +157,24 @@ impl<S: ShutdownStream> Connection for StreamConnection<S> {
                     buffer.truncate(n);
                     return Ok(buffer);
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(map_read_error(&e, self.closed.load(Ordering::SeqCst))),
+                Err(e)
+                    if e.kind() == io::ErrorKind::Interrupted
+                        && !self.interrupted.load(Ordering::SeqCst) =>
+                {
+                    continue
+                }
+                Err(e) => {
+                    let stopped = self.closed.load(Ordering::SeqCst)
+                        || self.interrupted.load(Ordering::SeqCst);
+                    return Err(map_read_error(&e, stopped));
+                }
             }
         }
     }
 
     fn interrupt(&self) {
         if !self.closed.load(Ordering::SeqCst) {
+            self.interrupted.store(true, Ordering::SeqCst);
             self.stream.shutdown_both();
         }
     }
@@ -438,6 +464,16 @@ pub mod windows_pipe {
             ms: u32,
         ) -> u32;
         fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
+    }
+
+    /// Cancels every pending I/O operation on `handle`, from any thread. Failure means there
+    /// was nothing to cancel (ERROR_NOT_FOUND).
+    pub(crate) fn cancel_all_io(handle: RawHandle) {
+        // SAFETY: a null OVERLAPPED cancels all of the handle's operations; the caller owns
+        // the handle for the duration of the call.
+        unsafe {
+            CancelIoEx(handle, std::ptr::null_mut());
+        }
     }
 
     const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
