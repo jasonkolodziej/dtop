@@ -36,8 +36,9 @@ jobs:
             TAG="v${VERSION}"
           fi
 
-          if [[ -z "${VERSION}" ]]; then
-            echo "A semantic-version value is required."
+          # Cargo rejects non-semver package versions, so validate before any build starts.
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "'${VERSION}' is not a semantic version; use a tag like v0.1.0 or v0.1.0-rc.1."
             exit 1
           fi
 
@@ -79,7 +80,8 @@ jobs:
           mkdir -p dist
           cp .build/release/dtop dist/dtop
           tar -czf "dist/dtop-${DTOP_VERSION}-linux-x86_64.tar.gz" -C dist dtop
-          sha256sum "dist/dtop-${DTOP_VERSION}-linux-x86_64.tar.gz" | tee "dist/dtop-${DTOP_VERSION}-linux-x86_64.tar.gz.sha256"
+          rm dist/dtop
+          cd dist && sha256sum "dtop-${DTOP_VERSION}-linux-x86_64.tar.gz" | tee "dtop-${DTOP_VERSION}-linux-x86_64.tar.gz.sha256"
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
@@ -117,7 +119,8 @@ jobs:
           mkdir -p dist
           cp .build/release/dtop dist/dtop
           tar -czf "dist/dtop-${DTOP_VERSION}-macos-arm64.tar.gz" -C dist dtop
-          shasum -a 256 "dist/dtop-${DTOP_VERSION}-macos-arm64.tar.gz" | tee "dist/dtop-${DTOP_VERSION}-macos-arm64.tar.gz.sha256"
+          rm dist/dtop
+          cd dist && shasum -a 256 "dtop-${DTOP_VERSION}-macos-arm64.tar.gz" | tee "dtop-${DTOP_VERSION}-macos-arm64.tar.gz.sha256"
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
@@ -162,12 +165,104 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item .build\release\dtop.exe dist\dtop.exe
           Compress-Archive -Path dist\dtop.exe -DestinationPath "dist\dtop-${env:DTOP_VERSION}-windows-x86_64.zip" -Force
-          (Get-FileHash "dist\dtop-${env:DTOP_VERSION}-windows-x86_64.zip" -Algorithm SHA256).Hash + "  dtop-${env:DTOP_VERSION}-windows-x86_64.zip" | Set-Content -Path "dist\dtop-${env:DTOP_VERSION}-windows-x86_64.zip.sha256"
+          Remove-Item dist\dtop.exe
+          (Get-FileHash "dist\dtop-${env:DTOP_VERSION}-windows-x86_64.zip" -Algorithm SHA256).Hash.ToLower() + "  dtop-${env:DTOP_VERSION}-windows-x86_64.zip" | Set-Content -Path "dist\dtop-${env:DTOP_VERSION}-windows-x86_64.zip.sha256"
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: dtop-windows
+          path: dist/*
+
+  # The Rust port in rust/ ships alongside the Swift build as dtop-rust-<version>-<os>-<arch>.
+  build-rust:
+    name: Build Rust release (${{ matrix.name }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+            platform: linux-x86_64
+            binary: dtop
+            archive: tar.gz
+          - name: macOS
+            os: macos-15
+            platform: macos-arm64
+            binary: dtop
+            archive: tar.gz
+          - name: Windows
+            os: windows-2022
+            platform: windows-x86_64
+            binary: dtop.exe
+            archive: zip
+    env:
+      DTOP_VERSION: ${{ needs.prepare.outputs.version }}
+      ASSET: dtop-rust-${{ needs.prepare.outputs.version }}-${{ matrix.platform }}.${{ matrix.archive }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustc +stable --version
+
+      # The binary reports CARGO_PKG_VERSION, so stamp the workspace version and refresh the
+      # lockfile entries for the workspace crates (there are no external dependencies).
+      - name: Stamp version into the build
+        run: |
+          sed -i.bak -E '/^\[workspace\.package\]/,/^\[/ s/^version = ".*"/version = "'"${DTOP_VERSION}"'"/' Cargo.toml
+          rm Cargo.toml.bak
+          cargo +stable update --workspace --offline
+
+      - name: Build release binary
+        run: cargo +stable build --release --locked -p dtop
+
+      - name: Verify binary version
+        run: |
+          reported="$(./target/release/${{ matrix.binary }} --version)"
+          echo "$reported"
+          [ "$reported" = "dtop ${DTOP_VERSION}" ]
+
+      # TLS loads OpenSSL with dlopen, so the binary must only link the C runtime.
+      - name: Check Linux shared library dependencies
+        if: runner.os == 'Linux'
+        run: |
+          ldd target/release/dtop
+          if ldd target/release/dtop | grep -vE 'linux-vdso|ld-linux|lib(c|m|dl|pthread|rt|gcc_s|util)\.so'; then
+            echo "Unexpected shared library dependency in the Rust release binary." >&2
+            exit 1
+          fi
+
+      - name: Package archive
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "target/release/${{ matrix.binary }}" "$GITHUB_WORKSPACE/dist/"
+          cd "$GITHUB_WORKSPACE/dist"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            pwsh -NoProfile -Command "Compress-Archive -Path '${{ matrix.binary }}' -DestinationPath '${ASSET}' -Force"
+          else
+            tar -czf "${ASSET}" "${{ matrix.binary }}"
+          fi
+          rm "${{ matrix.binary }}"
+          if command -v sha256sum > /dev/null; then
+            sha256sum "${ASSET}" | tee "${ASSET}.sha256"
+          else
+            shasum -a 256 "${ASSET}" | tee "${ASSET}.sha256"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtop-rust-${{ matrix.platform }}
           path: dist/*
 
   release:
@@ -177,6 +272,7 @@ jobs:
       - build-linux
       - build-macos
       - build-windows
+      - build-rust
     runs-on: ubuntu-24.04
     env:
       GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
@@ -207,10 +303,15 @@ jobs:
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$GPG_SIGNING_KEY" --armor --detach-sign "$file"
           done
 
+      # Per-artifact directories from download-artifact are flattened so `sha256sum -c checksums.txt`
+      # works next to the downloaded release assets.
       - name: Aggregate checksum manifest
         shell: bash
         run: |
-          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 | xargs -0 sha256sum > dist/checksums.txt
+          find dist -mindepth 2 -type f -exec mv {} dist/ \;
+          cd dist
+          sha256sum *.tar.gz *.zip > checksums.txt
+          cat checksums.txt
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -219,8 +320,8 @@ jobs:
           name: dtop ${{ env.VERSION_TAG }}
           generate_release_notes: true
           files: |
-            dist/**/*.tar.gz
-            dist/**/*.zip
-            dist/**/*.sha256
-            dist/**/*.asc
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/*.asc
             dist/checksums.txt

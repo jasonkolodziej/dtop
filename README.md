@@ -106,6 +106,22 @@ platform builds, GPG signing, checksum generation, and GitHub Release upload aut
 `v*.*.*` tags. On Linux, the release binary is built with the Swift runtime statically linked so the
 archive is runnable on a fresh Ubuntu host without the `libswiftCore.so` dependency.
 
+Each release carries both implementations, for Linux x86_64, macOS arm64 and Windows x86_64:
+
+| Implementation | Asset name |
+| --- | --- |
+| Swift | `dtop-<version>-<os>-<arch>.tar.gz` (`.zip` on Windows) |
+| Rust | `dtop-rust-<version>-<os>-<arch>.tar.gz` (`.zip` on Windows) |
+
+Every archive has a `.sha256` file and, when the signing secrets are set, a `.asc` GPG signature;
+`checksums.txt` lists them all. The Rust Linux binary links only the C runtime and loads OpenSSL
+at run time, so TLS endpoints need `libssl3` (or 1.1) installed.
+
+```bash
+wget https://github.com/jasonkolodziej/dtop/releases/download/v0.1.0/dtop-rust-0.1.0-linux-x86_64.tar.gz{,.sha256}
+sha256sum -c dtop-rust-0.1.0-linux-x86_64.tar.gz.sha256 && tar xzf dtop-rust-0.1.0-linux-x86_64.tar.gz
+```
+
 dtop finds Docker the way the Docker CLI does:
 
 1. `--host` or `--context` (both repeatable, for several hosts)
