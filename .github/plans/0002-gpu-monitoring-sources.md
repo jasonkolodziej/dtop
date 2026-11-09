@@ -80,6 +80,15 @@ Option 3, behind a `GPUCollecting` protocol:
   namespace, so it does nothing for remote daemons.
 - **Process cost**: `nvidia-smi` is started up to three times per refresh. If that proves too
   heavy, NVML via `dlopen` (option 2) can replace it behind the same protocol.
+- **A hung driver can make `nvidia-smi` block**, and it runs inside the host refresh. The Rust
+  version bounds each query to 5 s, kills it after that, keeps the last known GPUs on screen
+  without readings, and skips `nvidia-smi` for 30 s, so a wedged driver cannot stall container
+  monitoring (amended 2026-11-09).
+- **Intel host utilization depends on the same fdinfo access.** Intel has no busy-percent
+  file, so device utilization and memory are sums over readable clients. When any process
+  cannot be read, the Rust version reports them as unknown rather than an undercount, and the
+  GPU box says root is needed. Group membership (`render`, `video`) does not help: fdinfo is
+  guarded by ptrace access checks, not by the device node's permissions (amended 2026-11-09).
 - **Not covered yet**: AMD and Intel on Windows (would use `\GPU Engine(*)\Utilization Percentage`
   performance counters), and GPU power and temperature beyond NVIDIA's.
 - **Verification so far**: unit tests and an end-to-end run with a stand-in `nvidia-smi`. Real

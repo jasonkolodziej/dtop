@@ -3,6 +3,7 @@
 //! `docker compose` with the working directory and files recorded in the labels.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 use crate::api::ContainerAction;
 use crate::endpoint::DockerEndpoint;
@@ -189,6 +190,18 @@ impl CommandResult {
 /// Runs external commands; a trait so the app is testable without spawning processes.
 pub trait CommandRunning: Send + Sync {
     fn run(&self, invocation: &CommandInvocation) -> Result<CommandResult>;
+
+    /// Like `run`, but a command still running after `timeout` is killed and reported as
+    /// `DockerError::TimedOut`, so a wedged tool (such as `nvidia-smi` on a hung driver) cannot
+    /// stall its caller. Runners without a clock (test fakes) just run the command.
+    fn run_with_timeout(
+        &self,
+        invocation: &CommandInvocation,
+        timeout: Duration,
+    ) -> Result<CommandResult> {
+        let _ = timeout;
+        self.run(invocation)
+    }
 }
 
 /// Spawns processes with `std::process::Command`, resolving the executable on `PATH`.
@@ -209,8 +222,8 @@ impl Default for ProcessCommandRunner {
     }
 }
 
-impl CommandRunning for ProcessCommandRunner {
-    fn run(&self, invocation: &CommandInvocation) -> Result<CommandResult> {
+impl ProcessCommandRunner {
+    fn command(&self, invocation: &CommandInvocation) -> Result<std::process::Command> {
         let executable = resolve_executable(&invocation.executable, &self.path, self.platform, &|p| {
             std::path::Path::new(p).is_file()
         })
@@ -234,16 +247,93 @@ impl CommandRunning for ProcessCommandRunner {
         {
             command.current_dir(directory);
         }
-        let output = command.output().map_err(|e| {
-            DockerError::Io(format!(
-                "failed to launch {}: {e}",
-                invocation.display_string()
-            ))
-        })?;
+        Ok(command)
+    }
+}
+
+fn launch_failed(invocation: &CommandInvocation, error: &std::io::Error) -> DockerError {
+    DockerError::Io(format!(
+        "failed to launch {}: {error}",
+        invocation.display_string()
+    ))
+}
+
+/// Reads a child's pipe to the end on its own thread, so a full pipe never blocks the child.
+fn drain<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+    let mut pipe = pipe?;
+    std::thread::Builder::new()
+        .name("dtop-command-output".into())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+        .ok()
+}
+
+impl CommandRunning for ProcessCommandRunner {
+    fn run(&self, invocation: &CommandInvocation) -> Result<CommandResult> {
+        let output = self
+            .command(invocation)?
+            .output()
+            .map_err(|e| launch_failed(invocation, &e))?;
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
         Ok(CommandResult {
             exit_code: output.status.code().unwrap_or(-1),
+            output: text,
+        })
+    }
+
+    fn run_with_timeout(
+        &self,
+        invocation: &CommandInvocation,
+        timeout: Duration,
+    ) -> Result<CommandResult> {
+        use std::process::Stdio;
+        let mut child = self
+            .command(invocation)?
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| launch_failed(invocation, &e))?;
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // The output threads end once the killed child's pipes close; they are not
+                    // joined, in case a grandchild still holds a pipe open.
+                    return Err(DockerError::TimedOut(format!(
+                        "{} (stopped after {} s)",
+                        invocation.display_string(),
+                        timeout.as_secs_f64()
+                    )));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(DockerError::Io(format!(
+                        "waiting for {} failed: {e}",
+                        invocation.display_string()
+                    )));
+                }
+            }
+        };
+        let collect = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
+            handle.and_then(|h| h.join().ok()).unwrap_or_default()
+        };
+        let mut text = String::from_utf8_lossy(&collect(stdout)).into_owned();
+        text.push_str(&String::from_utf8_lossy(&collect(stderr)));
+        Ok(CommandResult {
+            exit_code: status.code().unwrap_or(-1),
             output: text,
         })
     }
@@ -599,5 +689,46 @@ mod tests {
             resolve_executable("nope", "/bin", Platform::Linux, &exists),
             None
         );
+    }
+
+    fn invocation(executable: &str, arguments: &[&str]) -> CommandInvocation {
+        CommandInvocation {
+            executable: executable.into(),
+            arguments: arguments.iter().map(|a| a.to_string()).collect(),
+            working_directory: None,
+            environment_remove: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn commands_that_overrun_their_timeout_are_killed() {
+        // About 30 s if left alone.
+        let slow = if cfg!(windows) {
+            invocation("ping", &["-n", "30", "127.0.0.1"])
+        } else {
+            invocation("sleep", &["30"])
+        };
+        let started = Instant::now();
+        let outcome =
+            ProcessCommandRunner::default().run_with_timeout(&slow, Duration::from_millis(300));
+        assert!(
+            matches!(outcome, Err(DockerError::TimedOut(_))),
+            "{outcome:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn commands_within_their_timeout_return_all_output() {
+        let quick = if cfg!(windows) {
+            invocation("cmd", &["/C", "echo out & echo err 1>&2 & exit 3"])
+        } else {
+            invocation("sh", &["-c", "echo out; echo err >&2; exit 3"])
+        };
+        let result = ProcessCommandRunner::default()
+            .run_with_timeout(&quick, Duration::from_secs(20))
+            .unwrap();
+        assert_eq!(result.exit_code, 3);
+        assert!(result.output.contains("out") && result.output.contains("err"));
     }
 }

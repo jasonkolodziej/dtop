@@ -508,8 +508,11 @@ GPU notes:
    individual containers. AMD and Intel on Windows are not supported yet; they would need Windows
    performance counters.
 2. Per-container AMD/Intel usage is read from other processes' `/proc/<pid>/fdinfo`, which needs
-   root. Without root, dtop still shows the GPU graph and says in the GPU box why per-container
-   values are missing. AMD's `rocm_smi_lib` isn't used: it is in maintenance mode (critical
+   root (or `CAP_SYS_PTRACE`); membership in the `render` or `video` groups does not grant it.
+   Without root, dtop still shows the GPU graph and says in the GPU box why per-container
+   values are missing. Intel GPUs have no busy-percent file, so their utilization is summed
+   from those same fdinfo files: without root, the Rust version shows it as `n/a` instead of a
+   number that leaves out other users' processes. AMD's `rocm_smi_lib` isn't used: it is in maintenance mode (critical
    fixes only since ROCm 7.0), and both it and its successor AMD SMI read the same amdgpu sysfs
    counters dtop reads directly. See [ADR 0002](.github/plans/0002-gpu-monitoring-sources.md).
 3. macOS shows the Mac's own GPU. Containers on macOS run in Docker Desktop's Linux VM, which
@@ -517,7 +520,10 @@ GPU notes:
    statistics are undocumented, so missing values show as unknown.
 4. Per-container attribution only works when dtop runs on the Docker host itself (same PID
    namespace). It does not work when dtop connects to a remote daemon.
-5. None of this has been tested on real GPU hardware yet; this environment has no GPU.
+5. Each `nvidia-smi` query may take 5 seconds in the Rust version. One that takes longer (a hung
+   NVIDIA driver) is stopped, the GPUs stay listed as `n/a` with the reason in the GPU box, and
+   `nvidia-smi` is tried again 30 seconds later, so container monitoring keeps updating.
+6. None of this has been tested on real GPU hardware yet; this environment has no GPU.
 6. Linux uses OpenSSL (loaded at runtime), macOS Network.framework, Windows SChannel. All three
    negotiate TLS 1.3 where the OS supports it (Windows 11 / Server 2022) and fall back to 1.2.
    See [ADR 0003](.github/plans/0003-tls-on-platform-stacks.md).

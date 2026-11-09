@@ -4,8 +4,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::compose::{resolve_executable, CommandInvocation, CommandRunning, ProcessCommandRunner};
+use crate::error::DockerError;
 use crate::platform::Platform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -517,6 +519,21 @@ impl GpuFileSystem for LocalGpuFileSystem {
     }
 }
 
+/// How long one `nvidia-smi` query may take. It normally answers in well under a second (a
+/// first call without persistence mode can take a couple of seconds); a hung driver can make it
+/// block indefinitely, and it runs inside the host refresh.
+pub const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(5);
+/// After a timed-out query, how long to leave `nvidia-smi` alone before trying again, so a hung
+/// driver costs one timeout per period instead of one per refresh.
+pub const NVIDIA_SMI_RETRY_SECONDS: f64 = 30.0;
+
+/// The outcome of one `nvidia-smi` query.
+enum SmiOutput {
+    Output(String),
+    Failed,
+    TimedOut,
+}
+
 /// GPUs on Linux (NVIDIA via `nvidia-smi`, AMD via amdgpu sysfs, AMD/Intel per process via DRM
 /// fdinfo) and Windows (NVIDIA via `nvidia-smi`).
 pub struct SystemGpuCollector {
@@ -527,6 +544,13 @@ pub struct SystemGpuCollector {
     proc_root: String,
     drm_root: String,
     tracker: Mutex<DrmUsageTracker>,
+    /// Bound on each `nvidia-smi` query (`NVIDIA_SMI_TIMEOUT` unless a test shortens it).
+    pub nvidia_smi_timeout: Duration,
+    /// When `nvidia-smi` may be tried again after a timeout (seconds, the `sample` clock).
+    nvidia_smi_retry_at: Mutex<Option<f64>>,
+    /// The NVIDIA GPUs from the last answer, shown without readings while `nvidia-smi` is not
+    /// answering, so the GPU box stays up and explains why.
+    nvidia_last_devices: Mutex<Vec<GpuDevice>>,
 }
 
 impl SystemGpuCollector {
@@ -546,6 +570,9 @@ impl SystemGpuCollector {
             proc_root: proc_root.into(),
             drm_root: drm_root.into(),
             tracker: Mutex::new(DrmUsageTracker::default()),
+            nvidia_smi_timeout: NVIDIA_SMI_TIMEOUT,
+            nvidia_smi_retry_at: Mutex::new(None),
+            nvidia_last_devices: Mutex::new(Vec::new()),
         }
     }
 
@@ -579,61 +606,150 @@ impl SystemGpuCollector {
         }
     }
 
-    fn run(&self, executable: &str, arguments: &[&str], result: &mut GpuSample) -> Option<String> {
+    /// Runs one `nvidia-smi` query. Failures of `required` queries are reported as issues;
+    /// timeouts always are.
+    fn run(
+        &self,
+        executable: &str,
+        arguments: &[&str],
+        required: bool,
+        result: &mut GpuSample,
+    ) -> SmiOutput {
         let invocation = CommandInvocation {
             executable: executable.into(),
             arguments: arguments.iter().map(|a| a.to_string()).collect(),
             working_directory: None,
             environment_remove: Vec::new(),
         };
-        match self.runner.run(&invocation) {
-            Ok(output) if output.succeeded() => Some(output.output),
+        match self
+            .runner
+            .run_with_timeout(&invocation, self.nvidia_smi_timeout)
+        {
+            Ok(output) if output.succeeded() => SmiOutput::Output(output.output),
             Ok(output) => {
-                let reason = output
-                    .output
-                    .lines()
-                    .next()
-                    .map_or_else(|| format!("exit code {}", output.exit_code), str::to_string);
-                result.issues.push(format!("nvidia-smi failed: {reason}"));
-                None
+                if required {
+                    let reason = output
+                        .output
+                        .lines()
+                        .next()
+                        .map_or_else(|| format!("exit code {}", output.exit_code), str::to_string);
+                    result.issues.push(format!("nvidia-smi failed: {reason}"));
+                }
+                SmiOutput::Failed
             }
+            Err(DockerError::TimedOut(_)) => SmiOutput::TimedOut,
             Err(error) => {
-                result
-                    .issues
-                    .push(format!("nvidia-smi could not run: {error}"));
-                None
+                if required {
+                    let reason = match error {
+                        DockerError::Io(reason) => reason,
+                        other => other.to_string(),
+                    };
+                    result
+                        .issues
+                        .push(format!("nvidia-smi could not run: {reason}"));
+                }
+                SmiOutput::Failed
             }
         }
     }
 
-    fn collect_nvidia(&self, executable: &str, result: &mut GpuSample) {
-        let Some(output) = self.run(executable, &nvidia_smi::DEVICE_QUERY_ARGUMENTS, result) else {
+    /// The last known NVIDIA GPUs with their readings cleared ("n/a", not stale numbers).
+    fn unanswered_nvidia_devices(&self, result: &mut GpuSample) {
+        let known = self
+            .nvidia_last_devices
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or_default();
+        if known.is_empty() || result.devices.iter().any(|d| d.vendor == GpuVendor::Nvidia) {
             return;
+        }
+        result.devices.extend(known.into_iter().map(|d| GpuDevice {
+            utilization: None,
+            memory_used: None,
+            temperature: None,
+            ..d
+        }));
+        result.process_attribution_complete = false;
+    }
+
+    fn nvidia_smi_hung_issue(&self, retry_in: f64) -> String {
+        format!(
+            "nvidia-smi did not answer within {} s and was stopped — the NVIDIA driver may be \
+             hung; retrying in {:.0} s",
+            self.nvidia_smi_timeout.as_secs_f64(),
+            retry_in.ceil()
+        )
+    }
+
+    /// Records a timed-out query: no more `nvidia-smi` until the retry time.
+    fn nvidia_smi_timed_out(&self, now: f64, result: &mut GpuSample) {
+        if let Ok(mut retry_at) = self.nvidia_smi_retry_at.lock() {
+            *retry_at = Some(now + NVIDIA_SMI_RETRY_SECONDS);
+        }
+        self.unanswered_nvidia_devices(result);
+        result
+            .issues
+            .push(self.nvidia_smi_hung_issue(NVIDIA_SMI_RETRY_SECONDS));
+    }
+
+    fn collect_nvidia(&self, executable: &str, now: f64, result: &mut GpuSample) {
+        let waiting = self
+            .nvidia_smi_retry_at
+            .lock()
+            .ok()
+            .and_then(|r| *r)
+            .filter(|at| *at > now);
+        if let Some(at) = waiting {
+            result.issues.push(self.nvidia_smi_hung_issue(at - now));
+            return self.unanswered_nvidia_devices(result);
+        }
+        let output = match self.run(
+            executable,
+            &nvidia_smi::DEVICE_QUERY_ARGUMENTS,
+            true,
+            result,
+        ) {
+            SmiOutput::Output(output) => output,
+            SmiOutput::Failed => return,
+            SmiOutput::TimedOut => return self.nvidia_smi_timed_out(now, result),
         };
         let devices = nvidia_smi::parse_devices(&output);
         if devices.is_empty() {
             return;
         }
+        if let Ok(mut known) = self.nvidia_last_devices.lock() {
+            *known = devices.iter().map(|d| d.device.clone()).collect();
+        }
         result
             .devices
             .extend(devices.iter().map(|d| d.device.clone()));
-        let apps = self
-            .run(executable, &nvidia_smi::COMPUTE_APPS_ARGUMENTS, result)
-            .map(|o| nvidia_smi::parse_compute_apps(&o))
-            .unwrap_or_default();
-        // pmon is optional (unsupported on some GPUs); without it only per-process % is lost.
-        let invocation = CommandInvocation {
-            executable: executable.into(),
-            arguments: nvidia_smi::PROCESS_MONITOR_ARGUMENTS
-                .iter()
-                .map(|a| a.to_string())
-                .collect(),
-            working_directory: None,
-            environment_remove: Vec::new(),
+        let apps = match self.run(
+            executable,
+            &nvidia_smi::COMPUTE_APPS_ARGUMENTS,
+            true,
+            result,
+        ) {
+            SmiOutput::Output(o) => nvidia_smi::parse_compute_apps(&o),
+            SmiOutput::Failed => Vec::new(),
+            SmiOutput::TimedOut => {
+                // The devices are known; per-process data waits for the retry.
+                result.process_attribution_complete = false;
+                return self.nvidia_smi_timed_out(now, result);
+            }
         };
-        let monitor = match self.runner.run(&invocation) {
-            Ok(o) if o.succeeded() => nvidia_smi::parse_process_monitor(&o.output),
-            _ => Vec::new(),
+        // pmon is optional (unsupported on some GPUs); without it only per-process % is lost.
+        let monitor = match self.run(
+            executable,
+            &nvidia_smi::PROCESS_MONITOR_ARGUMENTS,
+            false,
+            result,
+        ) {
+            SmiOutput::Output(o) => nvidia_smi::parse_process_monitor(&o),
+            SmiOutput::Failed => Vec::new(),
+            SmiOutput::TimedOut => {
+                self.nvidia_smi_timed_out(now, result);
+                Vec::new()
+            }
         };
         let mut uuid_by_index: HashMap<i64, String> = HashMap::new();
         for d in &devices {
@@ -814,10 +930,13 @@ impl SystemGpuCollector {
                 container_id: self.container_id(pid),
             });
         }
-        // Intel has no busy-percent file: derive device utilization from its clients.
+        // Intel has no busy-percent file: device utilization and memory are summed from its
+        // clients. With any process unreadable (any non-root run) that sum misses whatever those
+        // processes do — containers, usually — so it is unknown rather than a low number.
+        let has_intel = cards.iter().any(|(d, _)| d.vendor == GpuVendor::Intel);
         for (device, pdev) in cards
             .iter_mut()
-            .filter(|(d, _)| d.vendor == GpuVendor::Intel)
+            .filter(|(d, _)| d.vendor == GpuVendor::Intel && unreadable == 0)
         {
             let usages = usage_by_device
                 .get(pdev.as_str())
@@ -830,9 +949,15 @@ impl SystemGpuCollector {
         }
         let mut issues = Vec::new();
         if unreadable > 0 {
-            issues.push(format!(
-                "per-container AMD/Intel GPU usage needs root ({unreadable} processes were not readable)"
-            ));
+            issues.push(if has_intel {
+                format!(
+                    "Intel GPU usage and per-container GPU usage need root ({unreadable} processes were not readable)"
+                )
+            } else {
+                format!(
+                    "per-container AMD/Intel GPU usage needs root ({unreadable} processes were not readable)"
+                )
+            });
         }
         GpuSample {
             devices: cards.into_iter().map(|(d, _)| d).collect(),
@@ -856,7 +981,7 @@ impl GpuCollecting for SystemGpuCollector {
             ..Default::default()
         };
         if let Some(smi) = self.nvidia_smi.clone() {
-            self.collect_nvidia(&smi, &mut result);
+            self.collect_nvidia(&smi, now, &mut result);
         }
         if self.platform == Platform::Linux {
             let drm = self.collect_drm(now);
@@ -1277,6 +1402,140 @@ mod tests {
             Some(id.as_str())
         );
         assert!(sample.process_attribution_complete);
+    }
+
+    /// `nvidia-smi` that answers device queries from `devices` and hangs (times out) while
+    /// `hung` is set. Counts the queries it receives.
+    struct ScriptedSmi {
+        hung: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CommandRunning for ScriptedSmi {
+        fn run(&self, _: &CommandInvocation) -> Result<CommandResult> {
+            unreachable!("nvidia-smi queries must use run_with_timeout")
+        }
+        fn run_with_timeout(
+            &self,
+            invocation: &CommandInvocation,
+            _: Duration,
+        ) -> Result<CommandResult> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.hung.load(Ordering::SeqCst) {
+                return Err(DockerError::TimedOut(invocation.display_string()));
+            }
+            let output = if invocation.arguments[0].starts_with("--query-gpu") {
+                "0, GPU-abc, NVIDIA RTX, 45, 1024, 2048, 61\n"
+            } else {
+                ""
+            };
+            Ok(CommandResult {
+                exit_code: 0,
+                output: output.into(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_hung_nvidia_smi_is_stopped_and_left_alone_until_the_retry() {
+        use std::sync::atomic::Ordering;
+        let smi = Arc::new(ScriptedSmi {
+            hung: false.into(),
+            calls: 0.into(),
+        });
+        let collector = SystemGpuCollector::new(
+            Platform::Linux,
+            Some("/usr/bin/nvidia-smi".into()),
+            Arc::new(FakeFs(BTreeMap::new(), BTreeMap::new())),
+            Arc::clone(&smi) as Arc<dyn CommandRunning>,
+            "/proc",
+            "/sys/class/drm",
+        );
+        let healthy = collector.sample(0.0);
+        assert_eq!(healthy.devices[0].utilization, Some(45.0));
+        assert_eq!(smi.calls.load(Ordering::SeqCst), 3);
+
+        // The driver hangs: one timed-out query, then the GPU stays listed without readings.
+        smi.hung.store(true, Ordering::SeqCst);
+        let hung = collector.sample(2.0);
+        assert_eq!(smi.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(hung.devices.len(), 1);
+        assert_eq!(hung.devices[0].name, "NVIDIA RTX");
+        assert_eq!(hung.devices[0].utilization, None);
+        assert_eq!(hung.devices[0].memory_total, Some(2048 * 1_048_576));
+        assert!(!hung.process_attribution_complete);
+        assert!(
+            hung.issues[0].contains("did not answer within 5 s"),
+            "{:?}",
+            hung.issues
+        );
+
+        // Until the retry time nvidia-smi is not run at all.
+        let waiting = collector.sample(2.0 + NVIDIA_SMI_RETRY_SECONDS - 1.0);
+        assert_eq!(smi.calls.load(Ordering::SeqCst), 4);
+        assert!(
+            waiting.issues[0].contains("retrying in 1 s"),
+            "{:?}",
+            waiting.issues
+        );
+        assert_eq!(waiting.devices[0].utilization, None);
+
+        // Then it is tried again and recovers.
+        smi.hung.store(false, Ordering::SeqCst);
+        let recovered = collector.sample(2.0 + NVIDIA_SMI_RETRY_SECONDS);
+        assert_eq!(smi.calls.load(Ordering::SeqCst), 7);
+        assert_eq!(recovered.devices[0].utilization, Some(45.0));
+        assert!(recovered.issues.is_empty(), "{:?}", recovered.issues);
+    }
+
+    #[test]
+    fn intel_usage_is_unknown_when_some_processes_cannot_be_read() {
+        let fdinfo = |ns: u64| {
+            format!("drm-driver: i915\ndrm-client-id: 3\ndrm-pdev: 0000:00:02.0\ndrm-engine-render: {ns} ns\ndrm-resident-system: 4 MiB\n")
+        };
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert(
+            "/sys/class/drm/card0/device/vendor".into(),
+            "0x8086\n".into(),
+        );
+        files.insert(
+            "/sys/class/drm/card0/device/uevent".into(),
+            "PCI_SLOT_NAME=0000:00:02.0\n".into(),
+        );
+        files.insert("/proc/42/fdinfo/5".into(), fdinfo(0));
+        // Process 1 is listed but its fds cannot be read (another user's, e.g. root's).
+        files.insert("/proc/1/cgroup".into(), "0::/init.scope\n".into());
+        let links: BTreeMap<String, String> = [(
+            "/proc/42/fd/5".to_string(),
+            "/dev/dri/renderD128".to_string(),
+        )]
+        .into();
+        let collector = SystemGpuCollector::new(
+            Platform::Linux,
+            None,
+            Arc::new(FakeFs(files.clone(), links.clone())),
+            Arc::new(NoRunner),
+            "/proc",
+            "/sys/class/drm",
+        );
+        collector.sample(0.0);
+        files.insert("/proc/42/fdinfo/5".into(), fdinfo(250_000_000));
+        let collector = SystemGpuCollector {
+            file_system: Arc::new(FakeFs(files, links)),
+            ..collector
+        };
+        let sample = collector.sample(1.0);
+        assert_eq!(sample.devices.len(), 1);
+        // Only this user's 25% was visible; the device total is unknown, not 25%.
+        assert_eq!(sample.devices[0].utilization, None);
+        assert_eq!(sample.devices[0].memory_used, None);
+        assert!(!sample.process_attribution_complete);
+        assert!(
+            sample.issues[0].starts_with("Intel GPU usage and per-container GPU usage need root"),
+            "{:?}",
+            sample.issues
+        );
     }
 
     #[test]
