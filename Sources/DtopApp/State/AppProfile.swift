@@ -6,7 +6,7 @@ public struct AppProfile: Sendable {
 
     public static let current = AppProfile(
         name: "dtop",
-        version: "0.1.0",
+        version: BuildVersion.current,
         tagline: "Docker-first terminal observability and control",
         capabilities: [
             "Minimal terminal UI",
