@@ -1,0 +1,16 @@
+[package]
+name = "dtop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "dtop"
+path = "src/main.rs"
+
+[dependencies]
+dtop-app = { path = "../dtop-app" }
