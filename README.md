@@ -364,8 +364,21 @@ cd rust
 cargo build --release --locked
 ```
 
-The executable is `target/release/dtop` (`target/release/dtop.exe` on Windows). Run the Rust
-workspace tests and lints with:
+The executable is `target/release/dtop` (`target/release/dtop.exe` on Windows). Where the Rust
+version is stricter than the Swift one:
+
+- Pruning volumes (`X` on the Volumes tab) only ever removes unused *anonymous* volumes. Docker
+  APIs before 1.42 (Engine 23.0) also delete unused named volumes on prune, so there dtop refuses
+  and says why instead of pruning.
+- A single log line longer than 64 KiB keeps its first 64 KiB and ends in `… [line truncated]`,
+  so a container that never writes a newline cannot exhaust memory. Reconnected log streams
+  resume from the last line's exact (nanosecond) timestamp without dropping or repeating lines.
+- `--once` replaces control characters in names, labels and daemon messages with `�`, so the
+  report never contains escape sequences or extra lines.
+- Streams (`/events`, `logs -f`) keep the normal timeout for connecting and the TLS handshake and
+  only wait indefinitely for data once connected.
+
+Run the Rust workspace tests and lints with:
 
 ```bash
 cargo test --locked

@@ -155,13 +155,25 @@ The Rust port and terminal UI choice are recorded in [ADR 0004](.github/plans/00
 - `dtop --once` reports an actual Apple Silicon GPU sample. Prior manual pseudo-terminal checks
   also covered graphs, tabs, Compose, filtering, help, processes and confirmations.
 
+- CI on PR #5 passes on all three OSes, including Linux's two-daemon pseudo-terminal test (TLS
+  docker:dind plus the runner's socket) and the Windows named-pipe transport tests (round trips,
+  EOF, and cancellation racing reads and writes) against a real pipe server.
+- PR #5 review fixes, each with unit tests: exact nanosecond log cursors with boundary-line
+  de-duplication on reconnect; bounded memory for unterminated log lines and oversized frames;
+  `--once` output sanitized and control/bidi characters isolated in the TUI's text clustering;
+  volume prune refused on APIs before 1.42 (and `all=false` sent explicitly); finite connect and
+  TLS-handshake deadlines on streaming transports; the Images name sort honours `S`; custom
+  theme names keep their file-name case.
+
 ### Not done yet
-- Windows named-pipe integration and real pre-1809 SChannel behavior remain unverified. The first
-  Rust CI run passed the macOS and Windows jobs but failed Linux's two-daemon setup; its Docker
-  context environment has been corrected and needs a fresh CI run.
+- Windows named pipes against a real Docker Desktop daemon, and real pre-1809 SChannel behavior,
+  remain unverified.
 - Interactive testing in real macOS and Windows terminal applications and GPU tests on real
   NVIDIA, AMD and Intel hardware remain outstanding. Broader profiling on heterogeneous,
   production-scale hosts and Windows is still useful beyond the isolated 120-container run.
+- The Swift version still has the issues fixed in the Rust one during PR #5's review (prune on
+  APIs before 1.42, the Images name sort direction, lower-cased custom theme names, unbounded
+  partial log lines, escape sequences in `--once`); port the fixes back.
 - Compare the remaining Swift and Rust test coverage and address any gaps. The items in
   [Next Up](#next-up) remain future migration work, not completed by phases 5 and 6.
 
