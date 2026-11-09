@@ -1,13 +1,5 @@
 {
   "servers": {
-    "github": {
-      "type": "http",
-      "url": "https://api.githubcopilot.com/mcp/"
-    },
-    "cloudflare-documentation": {
-      "type": "http",
-      "url": "https://docs.mcp.cloudflare.com/mcp"
-    },
     "cloudflare-api": {
       "type": "http",
       "url": "https://mcp.cloudflare.com/mcp",
@@ -21,28 +13,6 @@
       "headers": {
         "CONTEXT7_API_KEY": "${input:context7-api-key}"
       }
-    },
-    "svelte": {
-      "type": "http",
-      "url": "https://mcp.svelte.dev/mcp"
-    },
-    "better-auth": {
-      "type": "http",
-      "url": "https://mcp.better-auth.com/mcp"
-    },
-    "deepwiki": {
-      "type": "http",
-      "url": "https://mcp.deepwiki.com/mcp"
-    },
-    "playwright": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest"]
-    },
-    "tailwindcss-server": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "tailwindcss-mcp-server"]
     },
     "shadcn-ui-svelte": {
       "type": "stdio",

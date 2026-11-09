@@ -1,0 +1,61 @@
+{
+	"mcpServers": {
+		"better-auth": {
+			"type": "http",
+			"url": "https://mcp.better-auth.com/mcp",
+			"tools": [
+				"*"
+			]
+		},
+		"cloudflare-documentation": {
+			"type": "http",
+			"url": "https://docs.mcp.cloudflare.com/mcp",
+			"tools": [
+				"*"
+			]
+		},
+		"deepwiki": {
+			"type": "http",
+			"url": "https://mcp.deepwiki.com/mcp",
+			"tools": [
+				"*"
+			]
+		},
+		"github": {
+			"type": "http",
+			"url": "https://api.githubcopilot.com/mcp/",
+			"tools": [
+				"*"
+			]
+		},
+		"playwright": {
+			"type": "stdio",
+			"command": "npx",
+			"args": [
+				"-y",
+				"@playwright/mcp@latest"
+			],
+			"tools": [
+				"*"
+			]
+		},
+		"svelte": {
+			"type": "http",
+			"url": "https://mcp.svelte.dev/mcp",
+			"tools": [
+				"*"
+			]
+		},
+		"tailwindcss-server": {
+			"type": "stdio",
+			"command": "npx",
+			"args": [
+				"-y",
+				"tailwindcss-mcp-server"
+			],
+			"tools": [
+				"*"
+			]
+		}
+	}
+}
