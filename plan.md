@@ -16,10 +16,12 @@ dependencies.
 
 ### Phase 0: Repository bootstrap ✅
 - Swift package, CI, project direction
+- VS Code launch configurations for debug and release builds (`.vscode/launch.json`)
 
 ### Phase 1: Core runtime and data layer ✅
 - `DockerEndpoint`: `DOCKER_HOST` parsing and per-platform socket discovery
-- Transports: Unix socket and TCP (POSIX), named pipe (Windows)
+- Transports: Unix socket and TCP (POSIX), named pipe and TCP (Windows, Winsock), and TLS on top
+  of TCP (Phase 6)
 - Incremental HTTP/1.1 client (content-length, chunked, until-close, streaming with interrupt)
 - `DockerClient`: version negotiation; containers, stats, top, logs and inspect; actions;
   images, networks and volumes, including prune; the `/events` stream
@@ -74,10 +76,24 @@ dependencies.
 - ✅ TLS 1.3 wherever the OS supports it, 1.2 otherwise. Windows uses `SCH_CREDENTIALS` (1.3 on
   Windows 11 / Server 2022) and falls back to `SCHANNEL_CRED` (1.2) before Windows 10 1809
 - ✅ Plain `tcp://` on Windows (Winsock)
-- ✅ Docker contexts: the active context, `--context`, `--all-contexts`
-- ✅ Several hosts at once: header chips, `[`/`]`, host list (`H`), `[host NAME]` config sections,
-  `--once` sections
-- ✅ Live log streaming (`logs?follow=1`) with follow/pause and reconnects
+- ✅ Client keys: RSA and ECDSA (P-256, P-384, P-521) in PKCS#1, SEC1 or PKCS#8 PEM, parsed and
+  converted in pure Swift; Windows imports them as named CNG keys and deletes them at exit
+- ✅ Errors that say what to change: untrusted CA, wrong name, missing or rejected client
+  certificate, a port that doesn't speak TLS, plain HTTP sent to a TLS daemon
+- ✅ Docker contexts: the active context (`DOCKER_CONTEXT`, `currentContext`), `--context`
+  (repeatable), `--all-contexts`; context directories found by SHA-256 of the name (built in);
+  `ssh://` contexts are skipped with a notice
+- ✅ Several hosts at once: repeatable `--host [NAME=]ENDPOINT`, header chips (● connected,
+  ○ connecting, ✕ offline; clickable), `[`/`]`, host list (`H`), `[host NAME]` config sections,
+  `--once` sections (exit 1 if any host is unreachable)
+- ✅ Routing: details, logs and actions go to the host on screen; compose commands get that host's
+  `--context`, or `--host` plus its TLS flags; GPU usage is attributed to the first local daemon
+- ✅ Live log streaming (`logs?follow=1`): keeps the last 5,000 lines; ● live, ⏸ paused, ■ ended,
+  ✕ stream lost; scrolling back pauses following, `f` or scrolling to the end resumes; pausing
+  updates (space) freezes the pane; running containers reconnect, stopped ones aren't polled. The
+  rules live in a pure, unit-tested `LogStreamPolicy`
+- ✅ SIGPIPE is ignored (a daemon rejecting the client certificate used to kill the process on
+  macOS); `DTOP_TLS_TRACE=1` traces the TLS backends
 - ✅ Verified with real handshakes against `openssl s_server` on all three OSes (including
   TLS 1.3-only and 1.2-only servers, with the negotiated version asserted), `--once` against a
   `--tlsverify` docker:dind daemon in CI, and pseudo-terminal e2e runs (two hosts, logs over TLS)
@@ -97,7 +113,11 @@ dependencies.
 Design decisions: [ADR 0001](.github/plans/0001-zero-dependency-cross-platform-architecture.md).
 Per-platform support and how each feature was verified: the feature matrix in `README.md`.
 
-- `Sources/DtopCore`: Docker transports, HTTP, API client, models, metrics, compose
+Design decisions: also [ADR 0002](.github/plans/0002-gpu-monitoring-sources.md) (GPU sources) and
+[ADR 0003](.github/plans/0003-tls-on-platform-stacks.md) (TLS on each platform's own stack).
+
+- `Sources/DtopCore`: Docker transports, TLS backends, hosts and contexts, HTTP, API client,
+  models, metrics, GPU collectors, compose
 - `Sources/DtopUI`: rendering primitives, widgets, themes, input, terminal
 - `Sources/DtopApp`: state and reducer, views, runtime (refresher and controller), configuration
 - `Sources/dtop/main.swift`: the entry point
