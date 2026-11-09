@@ -109,6 +109,26 @@ impl Library {
                         (apt install libssl3, dnf install openssl-libs, apk add libssl3) to use TLS endpoints"
                 .into());
         }
+        // Before anything else touches OpenSSL: don't register OPENSSL_cleanup with atexit.
+        // dtop exits (SIGTERM, `q`) while refresh and stream workers may still be inside
+        // OpenSSL, and the cleanup frees the global locks they use, crashing the process on
+        // the way out. The OS reclaims everything at exit anyway. The flag exists from 1.1.1b;
+        // older versions ignore it.
+        {
+            const OPENSSL_INIT_NO_ATEXIT: u64 = 0x0008_0000;
+            // SAFETY: NUL-terminated name; handle from dlopen.
+            let init = unsafe { dlsym(crypto, c"OPENSSL_init_crypto".as_ptr()) };
+            if !init.is_null() {
+                // SAFETY: `int OPENSSL_init_crypto(uint64_t opts, const OPENSSL_INIT_SETTINGS *)`.
+                let init = unsafe {
+                    std::mem::transmute::<Ptr, unsafe extern "C" fn(u64, *const c_void) -> c_int>(
+                        init,
+                    )
+                };
+                // SAFETY: a null settings pointer selects the defaults.
+                unsafe { init(OPENSSL_INIT_NO_ATEXIT, std::ptr::null()) };
+            }
+        }
         macro_rules! symbol {
             ($name:literal) => {{
                 let c = concat!($name, "\0");
