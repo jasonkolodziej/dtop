@@ -1,5 +1,5 @@
 //! Byte streams to the Docker daemon: Unix sockets and TCP through `std::net`/`std::os::unix`,
-//! Windows named pipes through `std::fs::File` plus `CancelIoEx`. TLS sits on top of TCP
+//! Windows named pipes through overlapped I/O and `CancelIoEx`. TLS sits on top of TCP
 //! (`crate::tls`). Everything above `Connection` is transport-agnostic.
 
 use std::io::{self, Read, Write};
@@ -314,73 +314,270 @@ pub fn make_transport(
 
 #[cfg(windows)]
 pub mod windows_pipe {
-    //! Docker Desktop's engine pipe. `std::fs::File` opens and reads it; `CancelIoEx` interrupts
-    //! a blocked read from another thread.
+    //! Docker Desktop's engine pipe, using cancellable overlapped I/O.
 
     use super::*;
     use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: RawHandle,
+    }
 
     #[link(name = "kernel32")]
     extern "system" {
-        fn CancelIoEx(handle: *mut c_void, overlapped: *mut c_void) -> i32;
+        fn CreateEventW(
+            attributes: *mut c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> RawHandle;
+        fn SetEvent(event: RawHandle) -> i32;
+        fn ReadFile(
+            handle: RawHandle,
+            buffer: *mut c_void,
+            bytes_to_read: u32,
+            bytes_read: *mut u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        fn WriteFile(
+            handle: RawHandle,
+            buffer: *const c_void,
+            bytes_to_write: u32,
+            bytes_written: *mut u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        fn GetOverlappedResult(
+            handle: RawHandle,
+            overlapped: *mut Overlapped,
+            bytes_transferred: *mut u32,
+            wait: i32,
+        ) -> i32;
+        fn CancelIoEx(handle: RawHandle, overlapped: *mut Overlapped) -> i32;
+        fn WaitForMultipleObjects(
+            count: u32,
+            handles: *const RawHandle,
+            wait_all: i32,
+            ms: u32,
+        ) -> u32;
         fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
     }
 
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const ERROR_BROKEN_PIPE: i32 = 109;
     const ERROR_PIPE_BUSY: i32 = 231;
     const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
     const ERROR_MORE_DATA: i32 = 234;
     const ERROR_OPERATION_ABORTED: i32 = 995;
+    const ERROR_IO_PENDING: i32 = 997;
+    const ERROR_NOT_FOUND: i32 = 1168;
+    const WAIT_FAILED: u32 = u32::MAX;
+    const INFINITE: u32 = u32::MAX;
+
+    fn event() -> io::Result<OwnedHandle> {
+        // SAFETY: null attributes/name create an unnamed manual-reset event.
+        let handle = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        if handle.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: CreateEventW returned a new handle owned by this value.
+            Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+        }
+    }
+
+    enum Operation<'a> {
+        Read(&'a mut [u8]),
+        Write(&'a [u8]),
+    }
 
     pub struct NamedPipeConnection {
         file: std::fs::File,
-        closed: AtomicBool,
+        cancelled: AtomicBool,
+        cancellation_event: OwnedHandle,
+    }
+
+    impl NamedPipeConnection {
+        fn check_open(&self) -> Result<()> {
+            if self.cancelled.load(Ordering::SeqCst) {
+                Err(DockerError::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn io_error(&self, error: io::Error, reading: bool, len: usize) -> Result<usize> {
+            if self.cancelled.load(Ordering::SeqCst)
+                || error.raw_os_error() == Some(ERROR_OPERATION_ABORTED)
+            {
+                return Err(DockerError::Cancelled);
+            }
+            match error.raw_os_error() {
+                Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED) if reading => Ok(0),
+                Some(ERROR_MORE_DATA) if reading => Ok(len),
+                _ => Err(DockerError::Io(format!(
+                    "{} failed: {error}",
+                    if reading { "ReadFile" } else { "WriteFile" }
+                ))),
+            }
+        }
+
+        fn cancel_pending(&self, overlapped: &mut Overlapped) -> Option<io::Error> {
+            // SAFETY: the pipe and overlapped operation remain alive until completion below.
+            let cancelled = unsafe { CancelIoEx(self.file.as_raw_handle(), overlapped) };
+            let error = if cancelled == 0 {
+                let error = io::Error::last_os_error();
+                (error.raw_os_error() != Some(ERROR_NOT_FOUND)).then_some(error)
+            } else {
+                None
+            };
+            let mut transferred = 0;
+            // SAFETY: waiting for completion keeps both OVERLAPPED and its buffer alive.
+            unsafe {
+                GetOverlappedResult(self.file.as_raw_handle(), overlapped, &mut transferred, 1);
+            }
+            error
+        }
+
+        fn transfer(&self, operation: Operation<'_>) -> Result<usize> {
+            self.check_open()?;
+            let completion_event = event().map_err(|error| {
+                DockerError::Io(format!("create pipe I/O event failed: {error}"))
+            })?;
+            let mut overlapped = Overlapped {
+                internal: 0,
+                internal_high: 0,
+                offset: 0,
+                offset_high: 0,
+                event: completion_event.as_raw_handle(),
+            };
+            let reading = matches!(&operation, Operation::Read(_));
+            let len = match &operation {
+                Operation::Read(buffer) => buffer.len(),
+                Operation::Write(buffer) => buffer.len(),
+            };
+            let size = u32::try_from(len)
+                .map_err(|_| DockerError::Io("pipe I/O request is too large".into()))?;
+            // SAFETY: the buffer, pipe handle, event and OVERLAPPED remain valid through
+            // completion, including when a pending operation must first be cancelled.
+            let started = unsafe {
+                match operation {
+                    Operation::Read(buffer) => ReadFile(
+                        self.file.as_raw_handle(),
+                        buffer.as_mut_ptr().cast(),
+                        size,
+                        std::ptr::null_mut(),
+                        &mut overlapped,
+                    ),
+                    Operation::Write(buffer) => WriteFile(
+                        self.file.as_raw_handle(),
+                        buffer.as_ptr().cast(),
+                        size,
+                        std::ptr::null_mut(),
+                        &mut overlapped,
+                    ),
+                }
+            };
+            if started == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_IO_PENDING) {
+                    return self.io_error(error, reading, len);
+                }
+                let handles = [
+                    self.cancellation_event.as_raw_handle(),
+                    completion_event.as_raw_handle(),
+                ];
+                // SAFETY: both event handles are valid for the duration of this wait.
+                let status = unsafe {
+                    WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE)
+                };
+                match status {
+                    0 => {
+                        if let Some(error) = self.cancel_pending(&mut overlapped) {
+                            return Err(DockerError::Io(format!("CancelIoEx failed: {error}")));
+                        }
+                        return Err(DockerError::Cancelled);
+                    }
+                    1 => {}
+                    _ => {
+                        let reason = if status == WAIT_FAILED {
+                            io::Error::last_os_error().to_string()
+                        } else {
+                            format!("unexpected wait status {status}")
+                        };
+                        let cancellation = self
+                            .cancel_pending(&mut overlapped)
+                            .map(|error| format!("; CancelIoEx failed: {error}"))
+                            .unwrap_or_default();
+                        return Err(DockerError::Io(format!(
+                            "wait for pipe I/O failed: {reason}{cancellation}"
+                        )));
+                    }
+                }
+            }
+            let mut transferred = 0;
+            // SAFETY: immediate success or the completion event means the operation is finished.
+            let completed = unsafe {
+                GetOverlappedResult(
+                    self.file.as_raw_handle(),
+                    &mut overlapped,
+                    &mut transferred,
+                    0,
+                )
+            };
+            if completed == 0 {
+                self.io_error(io::Error::last_os_error(), reading, len)
+            } else {
+                self.check_open()?;
+                Ok(transferred as usize)
+            }
+        }
     }
 
     impl Connection for NamedPipeConnection {
-        fn write_all(&self, bytes: &[u8]) -> Result<()> {
-            if self.closed.load(Ordering::SeqCst) {
-                return Err(DockerError::Cancelled);
+        fn write_all(&self, mut bytes: &[u8]) -> Result<()> {
+            self.check_open()?;
+            while !bytes.is_empty() {
+                let size = bytes.len().min(u32::MAX as usize);
+                let written = self.transfer(Operation::Write(&bytes[..size]))?;
+                if written == 0 {
+                    return Err(DockerError::Io(
+                        "WriteFile failed: connection closed".into(),
+                    ));
+                }
+                bytes = &bytes[written..];
             }
-            (&self.file)
-                .write_all(bytes)
-                .map_err(|e| DockerError::Io(format!("WriteFile failed: {e}")))
+            Ok(())
         }
 
         fn read(&self, max_len: usize) -> Result<Vec<u8>> {
-            if self.closed.load(Ordering::SeqCst) {
-                return Err(DockerError::Cancelled);
-            }
-            let mut buffer = vec![0u8; max_len.max(1)];
-            match (&self.file).read(&mut buffer) {
-                Ok(n) => {
-                    buffer.truncate(n);
-                    Ok(buffer)
-                }
-                Err(e) => match e.raw_os_error() {
-                    Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED) => Ok(Vec::new()),
-                    Some(ERROR_OPERATION_ABORTED) => Err(DockerError::Cancelled),
-                    Some(ERROR_MORE_DATA) => Ok(buffer),
-                    _ => Err(DockerError::Io(format!("ReadFile failed: {e}"))),
-                },
-            }
+            self.check_open()?;
+            let mut buffer = vec![0u8; max_len.max(1).min(u32::MAX as usize)];
+            let read = self.transfer(Operation::Read(&mut buffer))?;
+            buffer.truncate(read);
+            Ok(buffer)
         }
 
         fn interrupt(&self) {
-            if !self.closed.load(Ordering::SeqCst) {
-                // SAFETY: the handle is owned by `self.file` and valid while `self` lives.
-                unsafe {
-                    CancelIoEx(self.file.as_raw_handle(), std::ptr::null_mut());
+            if !self.cancelled.swap(true, Ordering::SeqCst) {
+                // SAFETY: the cancellation event is owned by this live connection.
+                if unsafe { SetEvent(self.cancellation_event.as_raw_handle()) } == 0 {
+                    eprintln!(
+                        "dtop: failed to signal named-pipe cancellation: {}",
+                        io::Error::last_os_error()
+                    );
                 }
             }
         }
 
         fn close(&self) {
-            if !self.closed.swap(true, Ordering::SeqCst) {
-                self.interrupt();
-            }
+            self.interrupt();
         }
     }
 
@@ -408,13 +605,20 @@ pub mod windows_pipe {
                 match std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
+                    .custom_flags(FILE_FLAG_OVERLAPPED)
                     .open(&self.path)
                 {
                     Ok(file) => {
+                        let cancellation_event = event().map_err(|error| {
+                            DockerError::Io(format!(
+                                "create named-pipe cancellation event failed: {error}"
+                            ))
+                        })?;
                         return Ok(Arc::new(NamedPipeConnection {
                             file,
-                            closed: AtomicBool::new(false),
-                        }))
+                            cancelled: AtomicBool::new(false),
+                            cancellation_event,
+                        }));
                     }
                     Err(e) => {
                         if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt == 0 {
