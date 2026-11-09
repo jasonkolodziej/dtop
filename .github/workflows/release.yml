@@ -71,7 +71,7 @@ jobs:
           swift-version: "6.0"
 
       - name: Build release binary
-        run: swift build -c release
+        run: swift build -c release --static-swift-stdlib
 
       - name: Package Linux archive
         shell: bash

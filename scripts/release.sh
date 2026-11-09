@@ -99,7 +99,11 @@ case "$OS_NAME" in
 cd "$ROOT_DIR"
 
 echo "==> Building release binary"
-swift build -c release
+if [[ "$PLATFORM" == linux-* ]]; then
+  swift build -c release --static-swift-stdlib
+else
+  swift build -c release
+fi
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dtop-release.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT

@@ -103,7 +103,8 @@ To create and push the annotated release tag:
 
 The GitHub Actions workflow in `.github/workflows/release.yml` performs the same version stamping,
 platform builds, GPG signing, checksum generation, and GitHub Release upload automatically for
-`v*.*.*` tags.
+`v*.*.*` tags. On Linux, the release binary is built with the Swift runtime statically linked so the
+archive is runnable on a fresh Ubuntu host without the `libswiftCore.so` dependency.
 
 dtop finds Docker the way the Docker CLI does:
 
