@@ -1,0 +1,36 @@
+# dtop in Rust: the same Docker/Compose terminal monitor as the Swift package one directory up,
+# with the same zero-third-party-dependency rule (ADR 0001, ADR 0004). Only `std` and the
+# platform C libraries, declared by hand where `std` does not cover them.
+[workspace]
+resolver = "2"
+members = ["crates/dtop-core", "crates/dtop-ui", "crates/dtop-app", "crates/dtop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "MIT"
+repository = "https://github.com/jasonkolodziej/dtop"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+redundant_clone = "warn"
+needless_collect = "warn"
+large_enum_variant = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+# Terminal geometry mixes usize/u16/i32 deliberately; casts are checked where they matter.
+cast_possible_truncation = "allow"
+too_many_arguments = "allow"
+module_inception = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"
