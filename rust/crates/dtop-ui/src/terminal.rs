@@ -37,6 +37,7 @@ impl TerminalSize {
 pub enum TerminalError {
     NotATerminal,
     ConfigurationFailed(String),
+    RuntimeFailed(String),
 }
 
 impl fmt::Display for TerminalError {
@@ -46,6 +47,7 @@ impl fmt::Display for TerminalError {
                 "dtop needs an interactive terminal — run it directly in a terminal, or use --once for plain output",
             ),
             TerminalError::ConfigurationFailed(reason) => write!(f, "Could not configure the terminal: {reason}"),
+            TerminalError::RuntimeFailed(reason) => write!(f, "dtop could not start: {reason}"),
         }
     }
 }

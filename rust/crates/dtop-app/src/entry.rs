@@ -204,8 +204,7 @@ fn connect(
         let client = client_for_host(&host, 30).map_err(|e| e.to_string())?;
         let api: Arc<dyn DockerApi> = Arc::new(client);
         let options = RefresherOptions {
-            // Compose commands name the host unless it is the docker CLI's own default.
-            host: (host.source != "default socket").then(|| host.clone()),
+            host: Some(host.clone()),
             gpu_collector: if Some(index) == gpu_host {
                 gpu.clone()
             } else {
@@ -238,21 +237,44 @@ fn run_once(hosts: &[HostConnection], environment: &HashMap<String, String>) -> 
         )]
         let handles: Vec<_> = hosts
             .iter()
-            .map(|h| {
-                scope.spawn(move || {
-                    let mut snapshot = h.refresher.refresh(true);
-                    if snapshot.connection.is_connected() {
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        snapshot = h.refresher.refresh(false);
-                    }
-                    snapshot
-                })
+            .enumerate()
+            .map(|(index, host)| {
+                std::thread::Builder::new()
+                    .name(format!("dtop-once-{index}"))
+                    .spawn_scoped(scope, move || {
+                        let mut snapshot = host.refresher.refresh(true);
+                        if snapshot.connection.is_connected() {
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            snapshot = host.refresher.refresh(false);
+                        }
+                        snapshot
+                    })
             })
             .collect();
         handles
             .into_iter()
             .zip(hosts)
-            .map(|(handle, h)| handle.join().unwrap_or_else(|_| h.refresher.snapshot()))
+            .map(|(handle, host)| {
+                let failure = match handle {
+                    Ok(handle) => match handle.join() {
+                        Ok(snapshot) => return snapshot,
+                        Err(_) => format!(
+                            "refresh worker for host '{}' failed — rerun dtop and check the error above",
+                            host.host.name
+                        ),
+                    },
+                    Err(error) => format!(
+                        "could not start refresh worker for host '{}': {error} — check system thread limits",
+                        host.host.name
+                    ),
+                };
+                let mut snapshot = host.refresher.snapshot();
+                snapshot.connection = ConnectionState::Disconnected {
+                    message: failure,
+                    retry_at: None,
+                };
+                snapshot
+            })
             .collect()
     });
     let width = environment
@@ -266,9 +288,7 @@ fn run_once(hosts: &[HostConnection], environment: &HashMap<String, String>) -> 
         .zip(snapshots)
         .collect();
     let report = once::render_hosts(&named, width);
-    let failed = named
-        .iter()
-        .any(|(_, s)| matches!(s.connection, ConnectionState::Disconnected { .. }));
+    let failed = named.iter().any(|(_, s)| !s.connection.is_connected());
     if failed && named.len() == 1 {
         print_error(report.trim_end_matches('\n'));
         return 1;
@@ -276,4 +296,47 @@ fn run_once(hosts: &[HostConnection], environment: &HashMap<String, String>) -> 
     print!("{report}");
     let _ = std::io::stdout().flush();
     i32::from(failed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dtop_core::transport::{Connection, Transport};
+    use dtop_core::{DockerClient, DockerEndpoint, DockerHost, Result};
+
+    struct PanickingTransport {
+        endpoint: DockerEndpoint,
+    }
+
+    impl Transport for PanickingTransport {
+        fn endpoint(&self) -> &DockerEndpoint {
+            &self.endpoint
+        }
+
+        fn connect(&self) -> Result<Arc<dyn Connection>> {
+            panic!("simulated refresh worker failure")
+        }
+    }
+
+    #[test]
+    fn once_reports_failure_when_a_host_refresh_worker_panics() {
+        let endpoint = DockerEndpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 1,
+        };
+        let host = DockerHost::new("broken", endpoint.clone());
+        let transport = Arc::new(PanickingTransport { endpoint });
+        let api: Arc<dyn DockerApi> = Arc::new(DockerClient::new(transport, None));
+        let refresher = Arc::new(DataRefresher::new(
+            Arc::clone(&api),
+            &host.description(),
+            RefresherOptions::default(),
+        ));
+        let connection = HostConnection {
+            host,
+            api,
+            refresher,
+        };
+        assert_eq!(run_once(&[connection], &HashMap::new()), 1);
+    }
 }

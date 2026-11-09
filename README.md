@@ -122,8 +122,7 @@ and exits with status 1 if any host could not be reached.
 
 ### TLS
 
-dtop reads the same settings as the Docker CLI, so a shell that already works with `docker` works
-with dtop:
+dtop reads the same settings as the Docker CLI, subject to the platform's certificate policies:
 
 ```bash
 DOCKER_HOST=tcp://prod.example.com:2376 DOCKER_TLS_VERIFY=1 DOCKER_CERT_PATH=/path/to/certs dtop
@@ -153,11 +152,17 @@ TLS runs on each platform's own stack, with no extra dependencies:
 | macOS | Network.framework | Client certificates are used from the PEM files in memory; nothing goes into the keychain |
 | Windows | SChannel | TLS 1.3 on Windows 11 and Server 2022, else 1.2 (Windows before 10 1809 is limited to 1.2). Client keys are imported into your CNG key store for the session and deleted when dtop exits |
 
+macOS requires TLS server certificates to include the `serverAuth` Extended Key Usage. The default
+`docker:dind` server certificate omits it, so use a server certificate reissued with
+`extendedKeyUsage = serverAuth` when connecting to that daemon from macOS. Certificate
+verification remains enabled. See [Apple's TLS certificate requirements](https://support.apple.com/en-us/103769).
+
 ### Docker contexts
 
 With no `--host` and no `DOCKER_HOST`, dtop uses the active Docker context, including its TLS
 material. `--context prod` picks one explicitly, and `--all-contexts` monitors every context (plus
-`default`). Contexts with `ssh://` endpoints are skipped with a notice.
+`default`). Contexts with `ssh://` endpoints are skipped with a notice. The Rust implementation
+reports a missing active or explicitly selected context instead of falling back to another daemon.
 
 ### Several hosts
 
@@ -349,9 +354,52 @@ swift run dtop
 `swift test` runs the full unit suite and needs no Docker daemon. The integration suite needs a
 reachable daemon. It creates labelled `alpine` containers and removes them afterwards.
 
+### Rust implementation
+
+The `rust/` workspace is a zero-third-party-dependency Rust implementation of dtop, with the same
+core, terminal UI, and application layers. Rust 1.81 or newer is required.
+
+```bash
+cd rust
+cargo build --release --locked
+```
+
+The executable is `target/release/dtop` (`target/release/dtop.exe` on Windows). Run the Rust
+workspace tests and lints with:
+
+```bash
+cargo test --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo fmt --all -- --check
+```
+
+For integration tests against a reachable Linux Docker daemon, run from `rust/`:
+
+```bash
+DTOP_INTEGRATION=1 cargo test --locked -p dtop-core --test integration
+DTOP_INTEGRATION=1 cargo test --locked -p dtop --test interactive  # macOS/Linux, needs docker and stty
+```
+
+The tests create labelled `alpine:3.20` containers and remove them afterwards; they pull the image
+if necessary. The pseudo-terminal test exercises two hosts, live log pause/resume, mouse switching,
+theme save/discard, and terminal restoration after SIGTERM using an isolated temporary config.
+Set `DTOP_SECONDARY_HOST` to a second, distinct Docker endpoint to also verify that paused logs
+and selection stay on the correct daemon when switching hosts. Use a Unix socket or an endpoint
+that accepts the same TLS credentials as the primary host. Docker host, context, and TLS
+environment settings are resolved as they are for dtop.
+
+The TLS integration tests use the `openssl` command-line tool. CI sets
+`DTOP_REQUIRE_TLS_TESTS=1` so a missing tool fails the test job instead of silently skipping TLS
+coverage. The Rust architecture and terminal UI decision are documented in
+[ADR 0004](.github/plans/0004-rust-port-and-terminal-ui.md).
+
 CI runs on every PR and push to `main`:
 
 - **Linux, macOS, Windows**: build, unit tests, and smoke tests of the executable.
+- **Rust workspace**: formatting, Clippy, tests with required TLS coverage, and a release build on
+  Linux, macOS, and Windows; Windows also forces the legacy SChannel handshake path. Linux checks
+  Rust 1.81 compatibility, runs the tests with 512 KB stacks, and exercises the real-daemon and
+  pseudo-terminal integration suites against both the local Docker daemon and a TLS Docker daemon.
 - **Linux only**:
   - The unit tests again with 512 KB thread stacks. macOS gives secondary threads 512 KB, so this catches debug-build stack overflows that Linux's 8 MB default would hide.
   - The integration suite and `dtop --once`, against the runner's Docker daemon.

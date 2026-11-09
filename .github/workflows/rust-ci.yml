@@ -1,0 +1,183 @@
+name: Rust CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Rust build & test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: macOS
+            os: macos-15
+          - name: Windows
+            os: windows-2022
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustc +stable --version
+
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+
+      - name: Clippy
+        run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Show openssl
+        run: command -v openssl && openssl version
+
+      - name: Test
+        env:
+          DTOP_REQUIRE_TLS_TESTS: "1"
+        run: cargo +stable test --locked
+
+      - name: Test legacy SChannel with real TLS handshakes
+        if: runner.os == 'Windows'
+        env:
+          DTOP_REQUIRE_TLS_TESTS: "1"
+        run: >-
+          cargo +stable test --locked -p dtop-core --features tls-test-support
+          --test tls legacy_schannel_uses_tls12_and_rejects_tls13_only_servers
+
+      - name: Test with 512 KB thread stacks
+        if: runner.os == 'Linux'
+        env:
+          DTOP_REQUIRE_TLS_TESTS: "1"
+        run: |
+          cargo +stable test --locked --all-features --lib --tests --no-run
+          ulimit -S -s 512
+          RUST_MIN_STACK=524288 cargo +stable test --locked --all-features --lib --tests
+
+      - name: Check minimum supported Rust version
+        if: runner.os == 'Linux'
+        run: |
+          rustup toolchain install 1.81.0 --profile minimal
+          rustup target add --toolchain 1.81.0 aarch64-apple-darwin x86_64-pc-windows-gnu
+          cargo +1.81.0 check --locked --all-targets --all-features
+          cargo +1.81.0 check --locked --all-targets --all-features --target aarch64-apple-darwin
+          cargo +1.81.0 check --locked --all-targets --all-features --target x86_64-pc-windows-gnu
+
+      - name: Integration tests against Docker
+        if: runner.os == 'Linux'
+        env:
+          DTOP_INTEGRATION: "1"
+        run: |
+          cargo +stable test --locked -p dtop-core --test integration
+          cargo +stable test --locked -p dtop --test interactive
+
+      - name: Build release
+        run: cargo +stable build --release --locked
+
+      - name: Smoke test executable
+        run: |
+          cargo +stable run --locked -p dtop -- --version
+          cargo +stable run --locked -p dtop -- --help > /dev/null
+          cargo +stable run --locked -p dtop -- --list-themes
+
+      - name: Smoke test multi-host failures
+        if: runner.os == 'Linux'
+        run: |
+          endpoint="$(docker context inspect --format '{{.Endpoints.docker.Host}}')"
+          cargo +stable run --locked -p dtop -- --once --no-gpu \
+            --host "first=$endpoint" --host "second=$endpoint" > "$RUNNER_TEMP/rust-multi-host.txt"
+          grep -Fxq '== first ==' "$RUNNER_TEMP/rust-multi-host.txt"
+          grep -Fxq '== second ==' "$RUNNER_TEMP/rust-multi-host.txt"
+          if cargo +stable run --locked -p dtop -- --once --no-gpu \
+              --host "first=$endpoint" --host "offline=unix://$RUNNER_TEMP/missing-docker.sock" \
+              > "$RUNNER_TEMP/rust-unreachable-host.txt" 2>&1; then
+            echo 'An unreachable host should make --once exit nonzero' >&2
+            exit 1
+          fi
+          grep -Fxq '== first ==' "$RUNNER_TEMP/rust-unreachable-host.txt"
+          grep -Fxq '== offline ==' "$RUNNER_TEMP/rust-unreachable-host.txt"
+
+      - name: Start TLS Docker daemon
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/dind-certs"
+          docker run -d --name dtop-rust-dind --privileged -p 127.0.0.1::2376 \
+            -e DOCKER_TLS_CERTDIR=/certs -v "$RUNNER_TEMP/dind-certs:/certs" docker:27-dind
+          port="$(docker port dtop-rust-dind 2376/tcp | awk -F: 'NR == 1 {print $NF}')"
+          test -n "$port"
+          echo "DTOP_DIND_PORT=$port" >> "$GITHUB_ENV"
+          ready=false
+          for i in $(seq 1 60); do
+            if [ -f "$RUNNER_TEMP/dind-certs/client/ca.pem" ] && \
+                [ -f "$RUNNER_TEMP/dind-certs/client/cert.pem" ] && \
+                [ -f "$RUNNER_TEMP/dind-certs/client/key.pem" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/dind-certs/client"
+              chmod 700 "$RUNNER_TEMP/dind-certs/client"
+              chmod 600 "$RUNNER_TEMP/dind-certs/client/key.pem"
+            fi
+            if docker --host "tcp://127.0.0.1:$port" --tlsverify \
+                --tlscacert "$RUNNER_TEMP/dind-certs/client/ca.pem" \
+                --tlscert "$RUNNER_TEMP/dind-certs/client/cert.pem" \
+                --tlskey "$RUNNER_TEMP/dind-certs/client/key.pem" version > /dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" != true ]; then
+            docker logs dtop-rust-dind
+            exit 1
+          fi
+          docker --host "tcp://127.0.0.1:$port" --tlsverify \
+            --tlscacert "$RUNNER_TEMP/dind-certs/client/ca.pem" \
+            --tlscert "$RUNNER_TEMP/dind-certs/client/cert.pem" \
+            --tlskey "$RUNNER_TEMP/dind-certs/client/key.pem" \
+            run -d --name rust-tls-probe alpine:3.20 sleep 600
+
+      - name: Integration tests against TLS Docker daemon
+        if: runner.os == 'Linux'
+        env:
+          DTOP_INTEGRATION: "1"
+          DOCKER_TLS_VERIFY: "1"
+          DOCKER_CERT_PATH: ${{ runner.temp }}/dind-certs/client
+        run: |
+          export DTOP_SECONDARY_HOST="$(docker context inspect --format '{{.Endpoints.docker.Host}}')"
+          export DOCKER_HOST="tcp://localhost:$DTOP_DIND_PORT"
+          cargo +stable test --locked -p dtop-core --test integration
+          cargo +stable test --locked -p dtop --test interactive
+
+      - name: Smoke test --once against TLS Docker daemon
+        if: runner.os == 'Linux'
+        env:
+          DOCKER_TLS_VERIFY: "1"
+          DOCKER_CERT_PATH: ${{ runner.temp }}/dind-certs/client
+        run: |
+          export DOCKER_HOST="tcp://localhost:$DTOP_DIND_PORT"
+          cargo +stable run --locked -p dtop -- --once --no-gpu \
+            --host "first=$DOCKER_HOST" --host "second=$DOCKER_HOST" | tee "$RUNNER_TEMP/rust-tls-once.txt"
+          grep -Fxq '== first ==' "$RUNNER_TEMP/rust-tls-once.txt"
+          grep -Fxq '== second ==' "$RUNNER_TEMP/rust-tls-once.txt"
+          grep -q rust-tls-probe "$RUNNER_TEMP/rust-tls-once.txt"
+
+      - name: Stop TLS Docker daemon
+        if: always() && runner.os == 'Linux'
+        run: |
+          if docker container inspect dtop-rust-dind > /dev/null 2>&1; then
+            docker rm --force dtop-rust-dind
+          fi

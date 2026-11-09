@@ -99,6 +99,70 @@ dependencies.
   `--tlsverify` docker:dind daemon in CI, and pseudo-terminal e2e runs (two hosts, logs over TLS)
 - ⏳ The Windows `SCHANNEL_CRED` fallback on a real pre-1809 system (CI forces it on Server 2022)
 
+## Rust
+
+A Rust version of dtop in `rust/`, on the `claude/rust-port` branch. It follows the phases above,
+has the same features and keeps the zero-dependency rule: only `std`, with platform C APIs
+(termios, Windows console, IOKit/CoreFoundation, Network.framework, Security, SSPI/CNG/crypt32,
+OpenSSL via `dlopen`) declared by hand. The workspace mirrors the Swift modules: `dtop-core`,
+`dtop-ui` (no dependency on core), `dtop-app` and the `dtop` binary.
+
+The Rust port and terminal UI choice are recorded in [ADR 0004](.github/plans/0004-rust-port-and-terminal-ui.md).
+
+### Status by phase
+- ✅ Phase 0: Cargo workspace, workspace lints (clippy `-D warnings` clean), `cargo fmt`
+- ✅ Phase 1: endpoint parsing and socket discovery; Unix socket, TCP and named-pipe transports
+  with cross-thread interrupt; incremental HTTP/1.1 parser; a lenient JSON parser (replaces
+  `JSONDecoder`); the Engine API client with version negotiation and `/events` and `logs -f`
+  streams; tolerant models; stats math, ring buffers, metrics store, backoff, process trees;
+  compose grouping and CLI invocations; GPU collectors (`nvidia-smi`, DRM fdinfo, amdgpu sysfs,
+  IOKit through hand-declared CoreFoundation)
+- ✅ Phase 2: colors and downsampling, text width with grapheme-like clusters, screen buffer, diff
+  renderer, layout, widgets, the ten themes (generated from the Swift sources) and the theme-file
+  format, the input parser, raw mode
+- ✅ Phase 3: every view (header, chips, graphs, tabs, tables, details, overlays, theme menu)
+- ✅ Phase 4: container, compose, image, network and volume management with confirmations
+- 🚧 Phase 5: reconnect and backoff, SIGTERM/SIGHUP handling, terminal restoration, too-small
+  fallback, bounded stats workers and explicit worker-failure reporting are implemented. The Rust
+  workflow configures the 3-OS matrix, required TLS tests, 512 KB Linux stack tests, Rust 1.81
+  checks, and real-daemon and pseudo-terminal integration tests. Native Windows and real terminal
+  and GPU-hardware checks still need the environments listed below.
+- 🚧 Phase 6: TLS host resolution and context overrides, several hosts, host list and chips,
+  host-scoped actions and Compose commands, and live log streaming with `LogStreamPolicy` are
+  implemented. TLS backends:
+  - ✅ macOS, through Network.framework with hand-built Objective-C blocks; the client identity is
+    built in memory
+  - ✅ Linux, through OpenSSL loaded with `dlopen`, using memory BIOs over dtop's own socket
+  - 🚧 Windows, SChannel (`SCH_CREDENTIALS` with fallback to `SCHANNEL_CRED`, CNG key import,
+    exclusive-root validation, TLS 1.3 tickets through `SEC_I_RENEGOTIATE`): Windows-target Clippy
+    and compilation pass; native execution and the forced legacy-path handshake await Windows CI
+
+### Verified so far
+- The Rust workspace suite and required real-handshake TLS tests pass on macOS and Linux
+  (`rust:1.85-bookworm`, OpenSSL 3.0.15), including the Linux 512 KB stack run. TLS tests cover
+  EC/RSA client keys, TLS 1.2/1.3, server names and certificate failures. macOS enforces its
+  `serverAuth` certificate-usage requirement rather than bypassing verification.
+- Real-daemon integration tests pass against Docker Desktop and a mutual-TLS Docker-in-Docker
+  daemon. Automated pseudo-terminal tests cover two hosts, live log pause/resume, mouse switching,
+  theme save/discard and SIGTERM restoration against both. A separate two-daemon test switches
+  from TLS to a local socket and checks paused logs stay with their original host; `--once` also
+  checks an unreachable host.
+- A release `--once` run against 120 real running containers on an isolated, resource-limited
+  TLS daemon rendered CPU and memory samples for all 120 in 1.44 seconds, including the one-second
+  sampling interval (28.6 MB maximum RSS). A separate fake-API test covers 512 containers and
+  asserts a maximum of eight concurrent stats requests.
+- `dtop --once` reports an actual Apple Silicon GPU sample. Prior manual pseudo-terminal checks
+  also covered graphs, tabs, Compose, filtering, help, processes and confirmations.
+
+### Not done yet
+- The new Rust CI workflow has not yet run on a native Windows runner. Windows named-pipe,
+  SChannel and forced legacy-credential handshakes, plus real pre-1809 behavior, remain unverified.
+- Interactive testing in real macOS and Windows terminal applications and GPU tests on real
+  NVIDIA, AMD and Intel hardware remain outstanding. Broader profiling on heterogeneous,
+  production-scale hosts and Windows is still useful beyond the isolated 120-container run.
+- Compare the remaining Swift and Rust test coverage and address any gaps. The items in
+  [Next Up](#next-up) remain future migration work, not completed by phases 5 and 6.
+
 ## Next Up
 - GPU: AMD and Intel on Windows via performance counters (`\GPU Engine(*)\Utilization Percentage`);
   optionally use AMD SMI / NVML directly (loaded at runtime) for richer metrics

@@ -1,7 +1,7 @@
 //! Docker hosts: endpoints with optional TLS, Docker CLI contexts, and the resolver that turns
 //! flags, environment and contexts into concrete hosts the way the Docker CLI does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::endpoint::DockerEndpoint;
@@ -51,6 +51,8 @@ pub struct DockerHost {
     pub tls: Option<TlsConfiguration>,
     /// Where it came from (`--host`, `DOCKER_HOST`, `context prod`, …), for messages.
     pub source: String,
+    /// Explicit TLS settings supersede a context's stored settings for CLI operations too.
+    pub context_tls_overridden: bool,
 }
 
 impl DockerHost {
@@ -60,6 +62,7 @@ impl DockerHost {
             endpoint,
             tls: None,
             source: String::new(),
+            context_tls_overridden: false,
         }
     }
 
@@ -80,8 +83,10 @@ impl DockerHost {
     /// Global `docker` CLI flags that reach this same daemon (used for `docker compose`):
     /// `--context` for contexts, else `--host` plus the TLS flags.
     pub fn docker_cli_arguments(&self) -> Vec<String> {
-        if let Some(context) = self.context_name() {
-            return vec!["--context".into(), context.into()];
+        if !self.context_tls_overridden {
+            if let Some(context) = self.context_name() {
+                return vec!["--context".into(), context.into()];
+            }
         }
         let mut arguments = vec!["--host".to_string(), self.endpoint.to_string()];
         if let Some(tls) = &self.tls {
@@ -398,7 +403,13 @@ pub fn resolve_hosts(
             if hosts.iter().any(|h| h.source == source) {
                 continue;
             }
-            match host_for_context(&context, None) {
+            match resolve_context(
+                &context,
+                None,
+                &TlsRequest::default(),
+                global_tls,
+                environment,
+            ) {
                 Ok(host) => hosts.push(host),
                 Err(error) => warnings.push(format!("context {}: {error}", context.name)),
             }
@@ -428,37 +439,86 @@ pub fn resolve_host(
             host.source = "context default".into();
             return Ok(host);
         }
-        let Some(context) = store.context(context_name) else {
-            let place = store
-                .meta_directory()
-                .unwrap_or_else(|| "~/.docker/contexts".into());
-            return Err(DockerError::InvalidEndpoint(format!(
-                "context '{context_name}' (not found in {place})"
-            )));
-        };
-        return host_for_context(&context, request.name.as_deref());
+        let context = store
+            .context(context_name)
+            .ok_or_else(|| missing_context(context_name, &store))?;
+        return resolve_context(
+            &context,
+            request.name.as_deref(),
+            &request.tls,
+            global_tls,
+            environment,
+        );
     }
     // A bare default request follows DOCKER_HOST, then the active context.
     if request.address.is_none() && environment.variable("DOCKER_HOST").is_none() {
         if let Some(active) = store.active_context_name().filter(|n| n != "default") {
-            if let Some(context) = store.context(&active) {
-                let mut host = host_for_context(&context, request.name.as_deref())?;
-                if !request.tls.is_empty() || !global_tls.is_empty() {
-                    // Explicit TLS flags still apply on top of the context.
-                    let override_request = HostRequest {
-                        name: Some(host.name.clone()),
-                        address: context.host.clone(),
-                        tls: request.tls.clone(),
-                        ..Default::default()
-                    };
-                    host = resolve_address(&override_request, global_tls, environment, false)?;
-                    host.source = format!("context {}", context.name);
-                }
-                return Ok(host);
-            }
+            let context = store
+                .context(&active)
+                .ok_or_else(|| missing_context(&active, &store))?;
+            return resolve_context(
+                &context,
+                request.name.as_deref(),
+                &request.tls,
+                global_tls,
+                environment,
+            );
         }
     }
     resolve_address(request, global_tls, environment, true)
+}
+
+fn missing_context(name: &str, store: &DockerContextStore<'_>) -> DockerError {
+    let place = store
+        .meta_directory()
+        .unwrap_or_else(|| "~/.docker/contexts".into());
+    DockerError::InvalidContext(format!(
+        "context '{name}' was not found in {place} — run docker context ls or select an existing context"
+    ))
+}
+
+fn resolve_context(
+    context: &DockerContext,
+    name: Option<&str>,
+    request_tls: &TlsRequest,
+    global_tls: &TlsRequest,
+    environment: &HostEnvironment,
+) -> Result<DockerHost> {
+    let mut tls_request = request_tls.merged_over(global_tls);
+    if tls_request.is_empty() {
+        return host_for_context(context, name);
+    }
+    let address = context.host.as_ref().ok_or_else(|| {
+        DockerError::InvalidContext(format!(
+            "context '{}' has no Docker endpoint — recreate it with docker context create",
+            context.name
+        ))
+    })?;
+    let context_tls = context.has_tls_material() || DockerEndpoint::scheme_implies_tls(address);
+    if !DockerEndpoint::parse(address, context_tls)?.is_tcp() {
+        return host_for_context(context, name);
+    }
+    if tls_request.certificate_directory.is_none() {
+        tls_request.ca_file = tls_request.ca_file.or_else(|| context.ca_file.clone());
+        tls_request.certificate_file = tls_request
+            .certificate_file
+            .or_else(|| context.certificate_file.clone());
+        tls_request.key_file = tls_request.key_file.or_else(|| context.key_file.clone());
+    }
+    if context_tls {
+        tls_request.verify = tls_request.verify.or(Some(!context.skip_tls_verify));
+        tls_request.enabled = tls_request.enabled.or(Some(true));
+    }
+    let request = HostRequest {
+        name: Some(name.unwrap_or(&context.name).to_string()),
+        address: Some(address.clone()),
+        tls: tls_request,
+        ..Default::default()
+    };
+    let mut host = resolve_address(&request, &TlsRequest::default(), environment, false)?;
+    host.source = format!("context {}", context.name);
+    host.context_tls_overridden = true;
+    Ok(host)
 }
 
 fn resolve_address(
@@ -493,7 +553,11 @@ fn resolve_address(
         Some(address) => DockerEndpoint::parse(address, wants_tls)?,
         None => DockerEndpoint::resolve(
             None,
-            &|_| None,
+            &|name| {
+                (name != "DOCKER_HOST")
+                    .then(|| environment.variable(name))
+                    .flatten()
+            },
             environment.platform,
             environment.home_directory.as_deref(),
             &|p| (environment.file_exists)(p),
@@ -513,6 +577,7 @@ fn resolve_address(
         endpoint,
         tls,
         source: source.into(),
+        context_tls_overridden: false,
     })
 }
 
@@ -572,12 +637,23 @@ fn tls_files(
 
 fn host_for_context(context: &DockerContext, name: Option<&str>) -> Result<DockerHost> {
     let Some(address) = &context.host else {
-        return Err(DockerError::InvalidEndpoint(format!(
-            "context '{}' has no Docker endpoint",
+        return Err(DockerError::InvalidContext(format!(
+            "context '{}' has no Docker endpoint — recreate it with docker context create",
             context.name
         )));
     };
     let endpoint = DockerEndpoint::parse(address, context.has_tls_material())?;
+    if endpoint.is_tcp() && context.certificate_file.is_some() != context.key_file.is_some() {
+        let missing = if context.certificate_file.is_none() {
+            "certificate (cert.pem)"
+        } else {
+            "key (key.pem)"
+        };
+        return Err(DockerError::Tls(format!(
+            "context '{}' has incomplete client TLS material: missing {missing} — recreate the Docker context",
+            context.name
+        )));
+    }
     let tls = (endpoint.is_tcp()
         && (context.has_tls_material() || DockerEndpoint::scheme_implies_tls(address)))
     .then(|| TlsConfiguration {
@@ -592,6 +668,7 @@ fn host_for_context(context: &DockerContext, name: Option<&str>) -> Result<Docke
         endpoint,
         tls,
         source: format!("context {}", context.name),
+        context_tls_overridden: false,
     })
 }
 
@@ -605,14 +682,16 @@ pub fn default_name(endpoint: &DockerEndpoint) -> String {
 
 /// Appends `-2`, `-3`, … to repeated names so every host has a distinct name.
 fn uniquely_named(hosts: Vec<DockerHost>) -> Vec<DockerHost> {
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut used = HashSet::new();
     hosts
         .into_iter()
         .map(|mut host| {
-            let count = seen.entry(host.name.clone()).or_insert(0);
-            *count += 1;
-            if *count > 1 {
-                host.name = format!("{}-{count}", host.name);
+            let base = host.name.clone();
+            let count = counts.entry(base.clone()).or_insert(1);
+            while !used.insert(host.name.clone()) {
+                *count += 1;
+                host.name = format!("{base}-{count}");
             }
             host
         })
@@ -733,6 +812,119 @@ pub mod tests {
     }
 
     #[test]
+    fn missing_active_context_does_not_fall_back_to_the_local_daemon() {
+        let env = env_with(
+            &[("DOCKER_CONTEXT", "missing")],
+            vec![("/var/run/docker.sock".into(), String::new())],
+        );
+        let error = resolve_host(&HostRequest::default(), &TlsRequest::default(), &env)
+            .expect_err("a missing active context must not select a different daemon");
+        assert!(error.to_string().contains("context 'missing'"));
+    }
+
+    #[test]
+    fn default_host_discovers_the_rootless_runtime_socket() {
+        let env = env_with(
+            &[("XDG_RUNTIME_DIR", "/run/user/1000")],
+            vec![("/run/user/1000/docker.sock".into(), String::new())],
+        );
+        let host = resolve_host(&HostRequest::default(), &TlsRequest::default(), &env).unwrap();
+        assert_eq!(
+            host.endpoint,
+            DockerEndpoint::UnixSocket("/run/user/1000/docker.sock".into())
+        );
+    }
+
+    #[test]
+    fn explicit_context_tls_overrides_keep_the_context_client_certificate() {
+        let mut files = context_files("prod", "tcp://prod.example:2376", true);
+        files.push(("/override/ca.pem".into(), "x".into()));
+        let env = env_with(&[], files);
+        let request = HostRequest {
+            context: Some("prod".into()),
+            ..Default::default()
+        };
+        let override_tls = TlsRequest {
+            verify: Some(false),
+            ca_file: Some("/override/ca.pem".into()),
+            ..Default::default()
+        };
+        let host = resolve_host(&request, &override_tls, &env).unwrap();
+        let tls = host.tls.as_ref().unwrap();
+        let directory = format!(
+            "/home/me/.docker/contexts/tls/{}/docker",
+            sha256::hex_digest("prod")
+        );
+        assert!(!tls.verify_peer);
+        assert_eq!(tls.ca_file.as_deref(), Some("/override/ca.pem"));
+        assert_eq!(
+            tls.certificate_file.as_deref(),
+            Some(format!("{directory}/cert.pem").as_str())
+        );
+        assert_eq!(
+            tls.key_file.as_deref(),
+            Some(format!("{directory}/key.pem").as_str())
+        );
+        assert_eq!(host.context_name(), Some("prod"));
+        assert_eq!(
+            host.docker_cli_arguments(),
+            vec![
+                "--host".to_string(),
+                "tcp://prod.example:2376".into(),
+                "--tls".into(),
+                "--tlscacert".into(),
+                "/override/ca.pem".into(),
+                "--tlscert".into(),
+                format!("{directory}/cert.pem"),
+                "--tlskey".into(),
+                format!("{directory}/key.pem"),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_contexts_apply_global_tls_flags_to_tcp_hosts() {
+        let mut files = context_files("prod", "tcp://prod.example:2376", false);
+        files.extend([
+            ("/var/run/docker.sock".into(), String::new()),
+            ("/override/ca.pem".into(), "x".into()),
+        ]);
+        let env = env_with(&[], files);
+        let global_tls = TlsRequest {
+            verify: Some(true),
+            ca_file: Some("/override/ca.pem".into()),
+            ..Default::default()
+        };
+        let result = resolve_hosts(&[], &global_tls, true, &env).unwrap();
+        let host = result
+            .hosts
+            .iter()
+            .find(|host| host.name == "prod")
+            .unwrap();
+        let tls = host.tls.as_ref().expect("global --tlsverify must apply");
+        assert!(tls.verify_peer);
+        assert_eq!(tls.ca_file.as_deref(), Some("/override/ca.pem"));
+        assert_eq!(host.docker_cli_arguments()[0], "--host");
+    }
+
+    #[test]
+    fn context_with_only_half_a_client_certificate_pair_is_rejected() {
+        let mut files = context_files("prod", "tcp://prod.example:2376", false);
+        let directory = format!(
+            "/home/me/.docker/contexts/tls/{}/docker",
+            sha256::hex_digest("prod")
+        );
+        files.push((format!("{directory}/cert.pem"), "x".into()));
+        let env = env_with(&[], files);
+        let request = HostRequest {
+            context: Some("prod".into()),
+            ..Default::default()
+        };
+        let error = resolve_host(&request, &TlsRequest::default(), &env).unwrap_err();
+        assert!(error.to_string().contains("key"));
+    }
+
+    #[test]
     fn all_contexts_skips_ssh_with_warning() {
         let mut files = context_files("remote", "ssh://me@box", false);
         files.extend(context_files("prod", "tcp://p:2375", false));
@@ -777,6 +969,16 @@ pub mod tests {
             HostRequest::parse("unix:///x=y").address.as_deref(),
             Some("unix:///x=y")
         );
+    }
+
+    #[test]
+    fn generated_host_suffixes_do_not_collide_with_existing_names() {
+        let env = env_with(&[], vec![]);
+        let requests =
+            ["a=tcp://one:1", "a-2=tcp://two:1", "a=tcp://three:1"].map(HostRequest::parse);
+        let result = resolve_hosts(&requests, &TlsRequest::default(), false, &env).unwrap();
+        let names: Vec<_> = result.hosts.iter().map(|host| host.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "a-2", "a-3"]);
     }
 
     #[test]

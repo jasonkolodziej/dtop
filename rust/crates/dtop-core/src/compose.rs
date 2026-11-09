@@ -96,6 +96,8 @@ pub struct CommandInvocation {
     pub executable: String,
     pub arguments: Vec<String>,
     pub working_directory: Option<String>,
+    /// Environment variables to remove from this child process.
+    pub environment_remove: Vec<String>,
 }
 
 impl CommandInvocation {
@@ -155,6 +157,20 @@ pub fn compose_invocation(
         executable: docker_executable.into(),
         arguments,
         working_directory: project.working_directory.clone(),
+        environment_remove: if host.is_some() || endpoint.is_some() {
+            [
+                "DOCKER_HOST",
+                "DOCKER_CONTEXT",
+                "DOCKER_TLS",
+                "DOCKER_TLS_VERIFY",
+                "DOCKER_CERT_PATH",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -208,6 +224,9 @@ impl CommandRunning for ProcessCommandRunner {
         command
             .args(&invocation.arguments)
             .stdin(std::process::Stdio::null());
+        for variable in &invocation.environment_remove {
+            command.env_remove(variable);
+        }
         if let Some(directory) = invocation
             .working_directory
             .as_ref()
@@ -538,7 +557,31 @@ mod tests {
             "docker --host tcp://prod:2376 --tlsverify --tlscacert /c/ca.pem compose --project-name app \
              --project-directory /srv/app --file /srv/app/compose.yaml up --detach"
         );
+        assert_eq!(
+            inv.environment_remove,
+            [
+                "DOCKER_HOST",
+                "DOCKER_CONTEXT",
+                "DOCKER_TLS",
+                "DOCKER_TLS_VERIFY",
+                "DOCKER_CERT_PATH",
+            ]
+        );
         assert_eq!(quote("it's"), r"'it'\''s'");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_runner_removes_requested_environment_only_from_the_child() {
+        let invocation = CommandInvocation {
+            executable: "/usr/bin/env".into(),
+            arguments: Vec::new(),
+            working_directory: None,
+            environment_remove: vec!["HOME".into()],
+        };
+        let result = ProcessCommandRunner::default().run(&invocation).unwrap();
+        assert!(result.succeeded());
+        assert!(!result.output.lines().any(|line| line.starts_with("HOME=")));
     }
 
     #[test]

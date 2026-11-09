@@ -584,6 +584,7 @@ impl SystemGpuCollector {
             executable: executable.into(),
             arguments: arguments.iter().map(|a| a.to_string()).collect(),
             working_directory: None,
+            environment_remove: Vec::new(),
         };
         match self.runner.run(&invocation) {
             Ok(output) if output.succeeded() => Some(output.output),
@@ -628,6 +629,7 @@ impl SystemGpuCollector {
                 .map(|a| a.to_string())
                 .collect(),
             working_directory: None,
+            environment_remove: Vec::new(),
         };
         let monitor = match self.runner.run(&invocation) {
             Ok(o) if o.succeeded() => nvidia_smi::parse_process_monitor(&o.output),

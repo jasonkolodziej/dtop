@@ -143,7 +143,7 @@ impl DataRefresher {
             })
             .map(|c| c.id.clone())
             .collect();
-        let raw = self.fetch_stats(&active);
+        let raw = self.fetch_stats(&active)?;
         let gpu = self.gpu_collector.as_ref().map(|g| g.sample(now));
         let needs_info = include_inventory || self.lock().snapshot.info.is_none();
         let mut warnings = Vec::new();
@@ -234,27 +234,64 @@ impl DataRefresher {
 
     /// Stats with bounded concurrency; individual failures (a container that just stopped) are
     /// skipped rather than failing the round.
-    pub fn fetch_stats(&self, ids: &[String]) -> Vec<(String, ContainerStats)> {
+    pub fn fetch_stats(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<(String, ContainerStats)>, DockerError> {
         if ids.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let next = AtomicUsize::new(0);
         let results = Mutex::new(Vec::new());
         let workers = self.stats_concurrency.min(ids.len());
-        std::thread::scope(|scope| {
+        std::thread::scope(|scope| -> Result<(), DockerError> {
+            let mut handles = Vec::with_capacity(workers);
+            let mut failure = None;
             for _ in 0..workers {
-                scope.spawn(|| loop {
-                    let index = next.fetch_add(1, Ordering::SeqCst);
-                    let Some(id) = ids.get(index) else { break };
-                    if let Ok(stats) = self.api.stats(id) {
-                        if let Ok(mut r) = results.lock() {
-                            r.push((id.clone(), stats));
+                match std::thread::Builder::new()
+                    .name("dtop-stats".into())
+                    .spawn_scoped(scope, || -> Result<(), DockerError> {
+                        loop {
+                            let index = next.fetch_add(1, Ordering::SeqCst);
+                            let Some(id) = ids.get(index) else { break };
+                            if let Ok(stats) = self.api.stats(id) {
+                                results
+                                    .lock()
+                                    .map_err(|_| {
+                                        DockerError::Io("stats result lock was poisoned".into())
+                                    })?
+                                    .push((id.clone(), stats));
+                            }
                         }
+                        Ok(())
+                    }) {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => {
+                        failure = Some(DockerError::Io(format!(
+                            "could not start a stats worker: {error} — check system thread limits"
+                        )));
+                        break;
                     }
-                });
+                }
             }
-        });
-        results.into_inner().unwrap_or_default()
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        failure.get_or_insert(error);
+                    }
+                    Err(_) => {
+                        failure.get_or_insert_with(|| {
+                            DockerError::Io("a stats worker failed unexpectedly".into())
+                        });
+                    }
+                }
+            }
+            failure.map_or(Ok(()), Err)
+        })?;
+        results
+            .into_inner()
+            .map_err(|_| DockerError::Io("stats result lock was poisoned".into()))
     }
 
     /// Loads detail-pane data for one container.

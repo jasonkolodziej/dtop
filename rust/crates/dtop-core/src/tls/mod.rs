@@ -2,13 +2,21 @@
 //! stack (ADR 0003): OpenSSL loaded at runtime on Linux, Network.framework on macOS, SChannel on
 //! Windows. Everything above `Connection` is TLS-agnostic.
 
+#[cfg(target_os = "macos")]
+mod apple;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod openssl;
 pub mod pem;
+#[cfg(windows)]
+mod schannel;
 
 use std::sync::Arc;
 
 use crate::client::DockerClient;
 use crate::endpoint::DockerEndpoint;
-use crate::error::{DockerError, Result};
+#[cfg(any(target_os = "macos", windows))]
+use crate::error::DockerError;
+use crate::error::Result;
 use crate::host::{DockerHost, TlsConfiguration};
 use crate::transport::{make_transport, Connection, Transport};
 
@@ -98,6 +106,13 @@ pub fn client_for_host(host: &DockerHost, timeout_seconds: u64) -> Result<Docker
     let transport = make_host_transport(host, timeout_seconds)?;
     let streaming = make_host_transport(host, 0)?;
     Ok(DockerClient::new(transport, Some(streaming)))
+}
+
+/// Forces SChannel's legacy credential path for the current thread during a test.
+#[cfg(all(windows, feature = "tls-test-support"))]
+#[doc(hidden)]
+pub fn with_legacy_schannel_for_test<T>(test: impl FnOnce() -> T) -> T {
+    schannel::with_legacy_credentials(test)
 }
 
 /// `DTOP_TLS_TRACE=1` logs TLS internals to stderr.
@@ -202,6 +217,7 @@ pub fn handshake_message(detail: &str, endpoint: &str, configuration: &TlsConfig
     message
 }
 
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn read_file(path: &str, what: &str) -> Result<String> {
     std::fs::read_to_string(path)
         .map_err(|e| DockerError::Tls(format!("could not read the {what} {path}: {e}")))
@@ -210,13 +226,51 @@ pub(crate) fn read_file(path: &str, what: &str) -> Result<String> {
 mod backend {
     use super::*;
 
-    pub fn connect(
-        transport: &TlsTransport,
-    ) -> Result<(Arc<dyn Connection>, Option<TlsProtocolVersion>)> {
-        let _ = transport;
-        Err(DockerError::Tls(
-            "TLS is not available in this build yet".into(),
-        ))
+    #[cfg(target_os = "macos")]
+    pub fn connect(t: &TlsTransport) -> Result<(Arc<dyn Connection>, Option<TlsProtocolVersion>)> {
+        let endpoint = t.endpoint.to_string();
+        let connection = apple::AppleTlsConnection::connect(
+            &t.host,
+            t.port,
+            &t.configuration,
+            &t.server_name(),
+            &endpoint,
+            t.timeout_seconds,
+        )?;
+        let negotiated = connection.negotiated;
+        Ok((Arc::new(connection), negotiated))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn connect(t: &TlsTransport) -> Result<(Arc<dyn Connection>, Option<TlsProtocolVersion>)> {
+        let endpoint = t.endpoint.to_string();
+        let stream =
+            crate::transport::connect_tcp(&t.host, t.port, t.timeout_seconds, &t.endpoint)?;
+        let raw: Arc<dyn Connection> = Arc::new(crate::transport::StreamConnection::new(stream));
+        let connection = openssl::OpenSslConnection::connect(
+            raw,
+            &t.configuration,
+            &t.server_name(),
+            &endpoint,
+        )?;
+        let negotiated = connection.negotiated;
+        Ok((Arc::new(connection), negotiated))
+    }
+
+    #[cfg(windows)]
+    pub fn connect(t: &TlsTransport) -> Result<(Arc<dyn Connection>, Option<TlsProtocolVersion>)> {
+        let endpoint = t.endpoint.to_string();
+        let stream =
+            crate::transport::connect_tcp(&t.host, t.port, t.timeout_seconds, &t.endpoint)?;
+        let raw: Arc<dyn Connection> = Arc::new(crate::transport::StreamConnection::new(stream));
+        let connection = schannel::SChannelConnection::connect(
+            raw,
+            &t.configuration,
+            &t.server_name(),
+            &endpoint,
+        )?;
+        let negotiated = connection.negotiated;
+        Ok((Arc::new(connection), negotiated))
     }
 }
 

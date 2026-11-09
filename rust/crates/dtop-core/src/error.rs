@@ -6,6 +6,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DockerError {
     InvalidEndpoint(String),
+    InvalidContext(String),
     UnsupportedEndpoint(String),
     ConnectionFailed {
         endpoint: String,
@@ -33,6 +34,7 @@ impl fmt::Display for DockerError {
                 "Invalid Docker endpoint '{value}' — use unix:///path/to/docker.sock, \
                  npipe:////./pipe/docker_engine, tcp://host:port or https://host:2376 (via --host or DOCKER_HOST)"
             ),
+            DockerError::InvalidContext(reason) => write!(f, "Invalid Docker context: {reason}"),
             DockerError::UnsupportedEndpoint(value) => write!(
                 f,
                 "Unsupported Docker endpoint '{value}' — dtop connects over unix sockets, named pipes and \

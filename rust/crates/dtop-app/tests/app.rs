@@ -89,6 +89,9 @@ impl DockerApi for FakeApi {
         })
     }
     fn stats(&self, id: &str) -> Result<ContainerStats> {
+        if id == "panic" {
+            panic!("simulated stats worker failure");
+        }
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_in_flight.fetch_max(now, Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -657,6 +660,77 @@ fn brackets_cycle_hosts_and_reset_selection() {
 }
 
 #[test]
+fn host_picker_wraps_and_mouse_selects_the_requested_host() {
+    let s = snapshot();
+    let mut state = AppState {
+        host_names: vec!["local".into(), "prod".into(), "test".into()],
+        ..AppState::default()
+    };
+    press(&mut state, &s, ch('H'));
+    press(&mut state, &s, key(Key::Up));
+    assert_eq!(state.mode, InputMode::HostPicker(2));
+    assert_eq!(
+        press(&mut state, &s, key(Key::Enter)),
+        vec![AppCommand::SwitchHost(2)]
+    );
+    assert_eq!(state.active_host, 2);
+
+    let mut hit_map = HitMap::new();
+    hit_map.host_chips = vec![(0, Rect::new(10, 0, 8, 1))];
+    let click = InputEvent::Mouse(MouseEvent::new(
+        MouseButton::Left,
+        MouseAction::Press,
+        12,
+        0,
+    ));
+    assert_eq!(
+        state.handle(&click, &s, &hit_map, 0.0, &[]),
+        vec![AppCommand::SwitchHost(0)]
+    );
+}
+
+#[test]
+fn switching_hosts_preserves_filters_but_resets_host_specific_navigation() {
+    let mut state = AppState {
+        host_names: vec!["local".into(), "remote".into()],
+        tab: Tab::Images,
+        sort_key: SortKey::Name,
+        sort_descending: false,
+        filter_text: "alpine".into(),
+        detail_scroll: 7,
+        log_follow: false,
+        ..AppState::default()
+    };
+    state.selected_ids.insert(Tab::Images, "old-image".into());
+    state.scroll_offsets.insert(Tab::Images, 4);
+    state.switch_host(1);
+    assert_eq!(state.tab, Tab::Images);
+    assert_eq!(state.sort_key, SortKey::Name);
+    assert!(!state.sort_descending);
+    assert_eq!(state.filter_text, "alpine");
+    assert!(state.selected_ids.is_empty() && state.scroll_offsets.is_empty());
+    assert_eq!(state.detail_scroll, 0);
+    assert!(state.log_follow);
+}
+
+#[test]
+fn single_host_shortcuts_explain_how_to_add_hosts() {
+    let s = snapshot();
+    let mut state = AppState {
+        host_names: vec!["local".into()],
+        ..AppState::default()
+    };
+    for shortcut in ['[', ']', 'H'] {
+        assert!(press(&mut state, &s, ch(shortcut)).is_empty());
+        assert_eq!(
+            state.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some(dtop_app::reducer::SINGLE_HOST_HINT)
+        );
+        assert_eq!(state.mode, InputMode::Normal);
+    }
+}
+
+#[test]
 fn f_follows_and_scrolling_back_pauses() {
     let s = snapshot();
     let mut state = AppState {
@@ -973,9 +1047,47 @@ fn stats_fan_out_respects_the_limit_and_tolerates_failures() {
         .map(|i| format!("c{i}"))
         .chain(["flaky".to_string()])
         .collect();
-    let results = refresher(Arc::clone(&api), None).fetch_stats(&ids);
+    let results = refresher(Arc::clone(&api), None).fetch_stats(&ids).unwrap();
     assert_eq!(results.len(), 10);
     assert!(api.max_in_flight.load(Ordering::SeqCst) <= 2);
+}
+
+#[test]
+fn failed_stats_workers_are_reported_instead_of_returning_partial_success() {
+    let api = Arc::new(FakeApi::default());
+    let error = refresher(api, None)
+        .fetch_stats(&["panic".into()])
+        .unwrap_err();
+    assert!(error.to_string().contains("stats worker failed"));
+}
+
+#[test]
+fn refresh_hundreds_of_containers_keeps_stats_concurrency_bounded() {
+    const CONTAINERS: usize = 512;
+    let api = Arc::new(FakeApi::default());
+    *api.containers.lock().unwrap() = (0..CONTAINERS)
+        .map(|index| {
+            let name = format!("container-{index}");
+            container(&name, &name, ContainerState::Running)
+        })
+        .collect();
+    let options = RefresherOptions {
+        history_size: 4,
+        stats_concurrency: 8,
+        clock: Arc::new(|| 1_000.0),
+        ..RefresherOptions::default()
+    };
+    let refresher = DataRefresher::new(api.clone(), "synthetic", options);
+    let started = std::time::Instant::now();
+    let snapshot = refresher.refresh(false);
+    let elapsed = started.elapsed();
+    assert_eq!(snapshot.connection, ConnectionState::Connected);
+    assert_eq!(snapshot.containers.len(), CONTAINERS);
+    assert_eq!(snapshot.metrics.latest.len(), CONTAINERS);
+    assert_eq!(api.stats_calls.load(Ordering::SeqCst), CONTAINERS);
+    let peak = api.max_in_flight.load(Ordering::SeqCst);
+    assert!((1..=8).contains(&peak));
+    eprintln!("synthetic {CONTAINERS}-container refresh: {elapsed:?}; peak stats requests: {peak}");
 }
 
 #[test]

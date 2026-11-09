@@ -35,14 +35,21 @@ pub enum LoopEvent {
     FastTick,
     DockerEvent(usize, DockerEvent),
     Refreshed(usize, Box<DockerSnapshot>),
-    DetailLoaded(usize, Box<ContainerDetailData>),
+    DetailLoaded {
+        generation: u64,
+        host: usize,
+        pane: DetailPane,
+        data: Box<ContainerDetailData>,
+    },
     OperationFinished(usize, OperationResult),
     LogLines {
+        generation: u64,
         host: usize,
         container_id: String,
         lines: Vec<LogLine>,
     },
     LogStreamEnded {
+        generation: u64,
         host: usize,
         container_id: String,
         error: Option<String>,
@@ -67,10 +74,17 @@ struct Session {
 }
 
 struct LogStream {
+    generation: u64,
     host: usize,
     container_id: String,
     cancelled: Arc<AtomicBool>,
     cancellation: Arc<StreamCancellation>,
+}
+
+struct LogRestart {
+    host: usize,
+    container_id: String,
+    at: f64,
 }
 
 impl LogStream {
@@ -100,11 +114,13 @@ pub struct AppController {
     environment: HashMap<String, String>,
     tick_count: u64,
     detail_key: Option<String>,
+    detail_generation: u64,
     is_loading_detail: bool,
     last_detail_load: f64,
     initial_notice: Option<String>,
     log_stream: Option<LogStream>,
-    log_restart_at: Option<f64>,
+    log_generation: u64,
+    log_restart: Option<LogRestart>,
     log_tail: usize,
     /// Lines that arrived while updates were paused; added when updates resume.
     paused_log_lines: Vec<LogLine>,
@@ -125,8 +141,14 @@ pub struct ControllerOptions {
     pub environment: HashMap<String, String>,
 }
 
-fn spawn(name: &str, body: impl FnOnce() + Send + 'static) {
-    let _ = std::thread::Builder::new().name(name.into()).spawn(body);
+fn spawn(name: &str, body: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(body)
+        .map(|_| ())
+        .map_err(|error| {
+            std::io::Error::new(error.kind(), format!("could not start {name}: {error}"))
+        })
 }
 
 fn read_text_file(path: &str) -> Option<String> {
@@ -181,11 +203,13 @@ impl AppController {
             environment: options.environment,
             tick_count: 0,
             detail_key: None,
+            detail_generation: 0,
             is_loading_detail: false,
             last_detail_load: 0.0,
             initial_notice: options.notice,
             log_stream: None,
-            log_restart_at: None,
+            log_generation: 0,
+            log_restart: None,
             paused_log_lines: Vec::new(),
             sender,
             receiver,
@@ -216,10 +240,19 @@ impl AppController {
         install_panic_hook();
         self.terminal.enter_fullscreen(self.configuration.mouse);
         self.terminal.write(&seq::set_title("dtop"));
-        self.start_input_thread();
-        self.start_timers();
-        for index in 0..self.sessions.len() {
-            self.start_docker_events(index);
+        let startup = (|| -> std::io::Result<()> {
+            self.start_input_thread()?;
+            self.start_timers()?;
+            for index in 0..self.sessions.len() {
+                self.start_docker_events(index)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = startup {
+            self.shutdown();
+            return Err(TerminalError::RuntimeFailed(format!(
+                "{error} — check system thread limits and try again"
+            )));
         }
         for index in 0..self.sessions.len() {
             self.request_refresh(index, true);
@@ -259,7 +292,7 @@ impl AppController {
 
     // MARK: - Producers
 
-    fn start_input_thread(&self) {
+    fn start_input_thread(&self) -> std::io::Result<()> {
         let sender = self.sender.clone();
         spawn("dtop-input", move || {
             let terminal = Terminal::new();
@@ -273,10 +306,10 @@ impl AppController {
                     return;
                 }
             }
-        });
+        })
     }
 
-    fn start_timers(&self) {
+    fn start_timers(&self) -> std::io::Result<()> {
         let interval = Duration::from_secs_f64(self.configuration.refresh_interval);
         for (name, period, fast) in [
             ("dtop-tick", interval, false),
@@ -299,11 +332,12 @@ impl AppController {
                         return;
                     }
                 }
-            });
+            })?;
         }
+        Ok(())
     }
 
-    fn start_docker_events(&self, host: usize) {
+    fn start_docker_events(&self, host: usize) -> std::io::Result<()> {
         let api = Arc::clone(&self.sessions[host].connection.api);
         let sender = self.sender.clone();
         let stop = Arc::clone(&self.stop);
@@ -343,7 +377,7 @@ impl AppController {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
-        });
+        })
     }
 
     // MARK: - Event handling
@@ -362,10 +396,20 @@ impl AppController {
                     let generation = self.input_generation;
                     let delay = Duration::from_secs_f64(self.parser.flush_delay());
                     let sender = self.sender.clone();
-                    spawn("dtop-flush", move || {
+                    if let Err(error) = spawn("dtop-flush", move || {
                         std::thread::sleep(delay);
                         let _ = sender.send(LoopEvent::FlushInput(generation));
-                    });
+                    }) {
+                        self.state.post(
+                            format!("{error} — check system thread limits"),
+                            NoticeLevel::Error,
+                            now,
+                            Some(8.0),
+                        );
+                        for input in self.parser.flush() {
+                            self.apply(&input, now);
+                        }
+                    }
                 }
             }
             LoopEvent::FlushInput(generation) => {
@@ -417,8 +461,12 @@ impl AppController {
                         self.request_refresh(index, true);
                     }
                 }
-                if self.log_restart_at.is_some_and(|at| now >= at) {
-                    self.log_restart_at = None;
+                if self
+                    .log_restart
+                    .as_ref()
+                    .is_some_and(|retry| now >= retry.at)
+                {
+                    self.log_restart = None;
                     self.update_log_stream(true);
                 }
             }
@@ -448,11 +496,20 @@ impl AppController {
                     self.request_refresh(host, inventory);
                 }
             }
-            LoopEvent::DetailLoaded(host, data) => {
-                if host != self.active() {
+            LoopEvent::DetailLoaded {
+                generation,
+                host,
+                pane,
+                data,
+            } => {
+                if generation != self.detail_generation {
                     return;
                 }
                 self.is_loading_detail = false;
+                if host != self.active() || pane != self.state.detail_pane {
+                    self.load_detail_if_needed(false);
+                    return;
+                }
                 let mut data = *data;
                 let selected = list::selected_item(self.snapshot(), &self.state)
                     .and_then(|i| i.container().map(|c| c.id.clone()));
@@ -469,6 +526,7 @@ impl AppController {
                     }
                     self.snapshot_mut().detail = Some(data);
                 }
+                self.load_detail_if_needed(false);
             }
             LoopEvent::OperationFinished(host, result) => {
                 let (level, duration) = if result.succeeded {
@@ -481,15 +539,14 @@ impl AppController {
                 self.load_detail_if_needed(true);
             }
             LoopEvent::LogLines {
+                generation,
                 host,
                 container_id,
                 lines,
             } => {
-                let matches = self
-                    .log_stream
-                    .as_ref()
-                    .is_some_and(|s| s.host == host && s.container_id == container_id)
-                    && host == self.active()
+                let matches = self.log_stream.as_ref().is_some_and(|s| {
+                    s.generation == generation && s.host == host && s.container_id == container_id
+                }) && host == self.active()
                     && self
                         .snapshot()
                         .detail
@@ -511,15 +568,14 @@ impl AppController {
                 self.append_streamed_logs(lines);
             }
             LoopEvent::LogStreamEnded {
+                generation,
                 host,
                 container_id,
                 error,
             } => {
-                if !self
-                    .log_stream
-                    .as_ref()
-                    .is_some_and(|s| s.host == host && s.container_id == container_id)
-                {
+                if !self.log_stream.as_ref().is_some_and(|s| {
+                    s.generation == generation && s.host == host && s.container_id == container_id
+                }) {
                     return;
                 }
                 self.log_stream = None;
@@ -538,7 +594,11 @@ impl AppController {
                         .container(&container_id)
                         .is_some_and(|c| c.state.is_active())
                     {
-                        self.log_restart_at = Some(now + if error.is_none() { 1.0 } else { 3.0 });
+                        self.log_restart = Some(LogRestart {
+                            host,
+                            container_id,
+                            at: now + if error.is_none() { 1.0 } else { 3.0 },
+                        });
                     }
                 }
             }
@@ -555,7 +615,6 @@ impl AppController {
             return;
         };
         detail.append_logs(lines);
-        detail.log_state = LogStreamState::Live;
         let kept = detail.logs.len();
         // Keep the same lines on screen while scrolled back; never past the oldest kept line.
         if !self.state.log_follow {
@@ -594,14 +653,22 @@ impl AppController {
                 let host = self.active();
                 let refresher = Arc::clone(&self.sessions[host].connection.refresher);
                 let sender = self.sender.clone();
-                spawn("dtop-operation", move || {
+                if let Err(error) = spawn("dtop-operation", move || {
                     let result = refresher.perform(&operation);
                     let _ = sender.send(LoopEvent::OperationFinished(host, result));
-                });
+                }) {
+                    self.state.post(
+                        format!("{error} — the operation was not started"),
+                        NoticeLevel::Error,
+                        now,
+                        Some(8.0),
+                    );
+                }
             }
             AppCommand::SwitchHost(_) => {
                 // The reducer already moved `active_host`; show that host's data.
                 self.detail_key = None;
+                self.detail_generation = self.detail_generation.wrapping_add(1);
                 self.is_loading_detail = false;
                 let snapshot = self.snapshot().clone();
                 self.state.reconcile_selection(&snapshot);
@@ -668,10 +735,22 @@ impl AppController {
         session.is_refreshing = true;
         let refresher = Arc::clone(&session.connection.refresher);
         let sender = self.sender.clone();
-        spawn("dtop-refresh", move || {
+        if let Err(error) = spawn("dtop-refresh", move || {
             let snapshot = refresher.refresh(inventory);
             let _ = sender.send(LoopEvent::Refreshed(host, Box::new(snapshot)));
-        });
+        }) {
+            let now = self.now();
+            let message = format!("{error} — check system thread limits");
+            let session = &mut self.sessions[host];
+            session.is_refreshing = false;
+            session.snapshot.connection = ConnectionState::Disconnected {
+                message: message.clone(),
+                retry_at: Some(now + 3.0),
+            };
+            if host == self.active() {
+                self.state.post(message, NoticeLevel::Error, now, Some(8.0));
+            }
+        }
     }
 
     fn details_visible(&self) -> bool {
@@ -704,20 +783,36 @@ impl AppController {
         {
             return;
         }
-        if !(force || self.detail_key.as_deref() != Some(key.as_str())) || self.is_loading_detail {
+        if self.detail_key.as_deref() == Some(key.as_str()) && (self.is_loading_detail || !force) {
             return;
         }
         self.detail_key = Some(key);
         self.is_loading_detail = true;
+        self.detail_generation = self.detail_generation.wrapping_add(1);
+        let generation = self.detail_generation;
         self.last_detail_load = now;
         let host = self.active();
         let refresher = Arc::clone(&self.sessions[host].connection.refresher);
         let sender = self.sender.clone();
         let is_active = container.state.is_active();
-        spawn("dtop-detail", move || {
+        if let Err(error) = spawn("dtop-detail", move || {
             let data = refresher.load_detail(&container.id, pane, is_active);
-            let _ = sender.send(LoopEvent::DetailLoaded(host, Box::new(data)));
-        });
+            let _ = sender.send(LoopEvent::DetailLoaded {
+                generation,
+                host,
+                pane,
+                data: Box::new(data),
+            });
+        }) {
+            self.is_loading_detail = false;
+            self.detail_key = None;
+            self.state.post(
+                format!("{error} — check system thread limits"),
+                NoticeLevel::Error,
+                now,
+                Some(8.0),
+            );
+        }
     }
 
     /// Which container's logs should stream right now, if any.
@@ -742,6 +837,17 @@ impl AppController {
     /// scheduled reconnect for a running container whose stream dropped.
     fn update_log_stream(&mut self, restart: bool) {
         let wanted = self.wanted_log_stream();
+        if self.log_restart.as_ref().is_some_and(|retry| {
+            wanted.as_ref().map_or(true, |target| {
+                retry.host != target.host || retry.container_id != target.container_id
+            })
+        }) {
+            self.log_restart = None;
+            self.paused_log_lines.clear();
+        }
+        if wanted.is_none() {
+            self.paused_log_lines.clear();
+        }
         let existing = wanted.as_ref().and_then(|t| {
             self.snapshot()
                 .detail
@@ -756,7 +862,7 @@ impl AppController {
             current,
             wanted.as_ref(),
             existing.as_ref().map(|d| &d.log_state),
-            self.log_restart_at.is_some(),
+            self.log_restart.is_some(),
             restart,
         );
         match decision {
@@ -765,14 +871,14 @@ impl AppController {
                 if let Some(stream) = self.log_stream.take() {
                     stream.cancel();
                 }
-                self.log_restart_at = None;
+                self.log_restart = None;
+                self.paused_log_lines.clear();
                 if decision == Decision::Stop {
                     return;
                 }
             }
         }
         let Some(wanted) = wanted else { return };
-        self.paused_log_lines.clear();
         let mut detail = existing.unwrap_or_else(|| ContainerDetailData::new(&wanted.container_id));
         // Same container as before (a reconnect, or it started again): keep what is on screen and
         // resume from the last line's timestamp instead of re-reading the tail.
@@ -787,7 +893,10 @@ impl AppController {
         let api = Arc::clone(&self.sessions[wanted.host].connection.api);
         let subscription = api.follow_logs(&wanted.container_id, self.log_tail, resume_after);
         let cancelled = Arc::new(AtomicBool::new(false));
+        self.log_generation = self.log_generation.wrapping_add(1);
+        let generation = self.log_generation;
         let stream = LogStream {
+            generation,
             host: wanted.host,
             container_id: wanted.container_id.clone(),
             cancelled: Arc::clone(&cancelled),
@@ -795,7 +904,9 @@ impl AppController {
         };
         let sender = self.sender.clone();
         let (host, container_id) = (wanted.host, wanted.container_id);
-        spawn("dtop-logs-forward", move || {
+        let error_container_id = container_id.clone();
+        self.log_stream = Some(stream);
+        if let Err(error) = spawn("dtop-logs-forward", move || {
             let error = loop {
                 match subscription.receiver.recv() {
                     Ok(StreamItem::Item(batch)) => {
@@ -803,6 +914,7 @@ impl AppController {
                         let fresh = log_policy::new_lines(batch, resume_after);
                         if !fresh.is_empty() && !cancelled.load(Ordering::SeqCst) {
                             let event = LoopEvent::LogLines {
+                                generation,
                                 host,
                                 container_id: container_id.clone(),
                                 lines: fresh,
@@ -818,13 +930,20 @@ impl AppController {
             };
             if !cancelled.load(Ordering::SeqCst) {
                 let _ = sender.send(LoopEvent::LogStreamEnded {
+                    generation,
                     host,
                     container_id,
                     error,
                 });
             }
-        });
-        self.log_stream = Some(stream);
+        }) {
+            self.handle(LoopEvent::LogStreamEnded {
+                generation,
+                host,
+                container_id: error_container_id,
+                error: Some(format!("{error} — check system thread limits")),
+            });
+        }
     }
 
     // MARK: - Rendering
@@ -957,4 +1076,240 @@ fn local_time() -> (i32, i32, i32) {
         i32::from(time.minute),
         i32::from(time.second),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dtop_core::logstream::LogStreamKind;
+    use dtop_core::models::{Container, ContainerState};
+    use dtop_core::platform::Platform;
+    use dtop_core::tls::client_for_host;
+    use dtop_core::DockerEndpoint;
+    use dtop_ui::{Key, KeyEvent};
+
+    fn controller() -> AppController {
+        let hosts = ["first", "second"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let host = DockerHost::new(
+                    name,
+                    DockerEndpoint::Tcp {
+                        host: "127.0.0.1".into(),
+                        port: 1 + index as u16,
+                    },
+                );
+                let api: Arc<dyn DockerApi> = Arc::new(client_for_host(&host, 1).unwrap());
+                let refresher = Arc::new(DataRefresher::new(
+                    Arc::clone(&api),
+                    &host.description(),
+                    crate::refresher::RefresherOptions::default(),
+                ));
+                HostConnection {
+                    host,
+                    api,
+                    refresher,
+                }
+            })
+            .collect();
+        let mut controller = AppController::new(ControllerOptions {
+            configuration: AppConfiguration::default(),
+            hosts,
+            notice: None,
+            theme: Theme::named("harbor").unwrap(),
+            color_mode: ColorMode::None,
+            theme_loader: ThemeLoader {
+                themes_directory: None,
+                platform: Platform::current(),
+            },
+            theme_names: Vec::new(),
+            theme_store: ThemeStore::new(None, None, Platform::current()),
+            environment: HashMap::new(),
+        });
+        controller.size = TerminalSize {
+            columns: 150,
+            rows: 40,
+        };
+        for (index, session) in controller.sessions.iter_mut().enumerate() {
+            let id = format!("container-{index}");
+            session.snapshot.containers =
+                vec![Container::new(&id, &id, "alpine", ContainerState::Exited)];
+            let mut detail = ContainerDetailData::new(&id);
+            detail.log_state = LogStreamState::Live;
+            session.snapshot.detail = Some(detail);
+        }
+        controller.state.detail_pane = DetailPane::Logs;
+        controller.log_stream = Some(LogStream {
+            generation: 1,
+            host: 0,
+            container_id: "container-0".into(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cancellation: Arc::new(StreamCancellation::default()),
+        });
+        controller
+    }
+
+    #[test]
+    fn resuming_buffered_logs_preserves_the_ended_stream_status() {
+        let mut controller = controller();
+        controller.state.is_paused = true;
+        controller.handle(LoopEvent::LogLines {
+            generation: 1,
+            host: 0,
+            container_id: "container-0".into(),
+            lines: vec![LogLine::new(LogStreamKind::Stdout, "last line")],
+        });
+        controller.handle(LoopEvent::LogStreamEnded {
+            generation: 1,
+            host: 0,
+            container_id: "container-0".into(),
+            error: None,
+        });
+        controller.apply(&InputEvent::Key(KeyEvent::new(Key::Char(' '))), 1.0);
+        let detail = controller.snapshot().detail.as_ref().unwrap();
+        assert_eq!(detail.logs[0].text, "last line");
+        assert_eq!(detail.log_state, LogStreamState::Ended(None));
+    }
+
+    #[test]
+    fn buffered_logs_are_not_added_to_a_different_host_after_hiding_the_pane() {
+        let mut controller = controller();
+        controller.state.is_paused = true;
+        controller.handle(LoopEvent::LogLines {
+            generation: 1,
+            host: 0,
+            container_id: "container-0".into(),
+            lines: vec![LogLine::new(LogStreamKind::Stdout, "first host only")],
+        });
+        controller.state.detail_pane = DetailPane::Overview;
+        controller.update_log_stream(false);
+        controller.state.switch_host(1);
+        controller.apply(&InputEvent::Key(KeyEvent::new(Key::Char(' '))), 1.0);
+        assert!(controller
+            .snapshot()
+            .detail
+            .as_ref()
+            .unwrap()
+            .logs
+            .is_empty());
+    }
+
+    #[test]
+    fn stale_log_events_cannot_end_or_modify_a_new_stream_for_the_same_container() {
+        let mut controller = controller();
+        controller.log_stream.as_mut().unwrap().generation = 2;
+        controller.handle(LoopEvent::LogLines {
+            generation: 1,
+            host: 0,
+            container_id: "container-0".into(),
+            lines: vec![LogLine::new(LogStreamKind::Stdout, "stale")],
+        });
+        controller.handle(LoopEvent::LogStreamEnded {
+            generation: 1,
+            host: 0,
+            container_id: "container-0".into(),
+            error: Some("old connection closed".into()),
+        });
+        assert_eq!(controller.log_stream.as_ref().unwrap().generation, 2);
+        assert!(controller
+            .snapshot()
+            .detail
+            .as_ref()
+            .unwrap()
+            .logs
+            .is_empty());
+        controller.handle(LoopEvent::LogLines {
+            generation: 2,
+            host: 0,
+            container_id: "container-0".into(),
+            lines: vec![LogLine::new(LogStreamKind::Stdout, "current")],
+        });
+        assert_eq!(
+            controller.snapshot().detail.as_ref().unwrap().logs[0].text,
+            "current"
+        );
+    }
+
+    #[test]
+    fn switching_hosts_cancels_the_previous_containers_log_retry() {
+        let mut controller = controller();
+        controller.sessions[0].snapshot.containers[0].state = ContainerState::Running;
+        controller.handle(LoopEvent::LogStreamEnded {
+            generation: 1,
+            host: 0,
+            container_id: "container-0".into(),
+            error: Some("connection lost".into()),
+        });
+        assert!(controller.log_restart.is_some());
+        controller.sessions[1]
+            .snapshot
+            .detail
+            .as_mut()
+            .unwrap()
+            .log_state = LogStreamState::Ended(None);
+        controller.state.switch_host(1);
+        controller.update_log_stream(false);
+        assert!(controller.log_restart.is_none());
+        assert!(controller.log_stream.is_none());
+    }
+
+    #[test]
+    fn stale_detail_results_cannot_replace_a_newer_request() {
+        let mut controller = controller();
+        controller.state.detail_pane = DetailPane::Overview;
+        controller.detail_key = Some("container-0:Overview".into());
+        controller.detail_generation = 2;
+        controller.is_loading_detail = true;
+        let mut stale = ContainerDetailData::new("container-0");
+        stale.error = Some("old request".into());
+        controller.handle(LoopEvent::DetailLoaded {
+            generation: 1,
+            host: 0,
+            pane: DetailPane::Overview,
+            data: Box::new(stale),
+        });
+        assert!(controller.is_loading_detail);
+        assert!(controller
+            .snapshot()
+            .detail
+            .as_ref()
+            .unwrap()
+            .error
+            .is_none());
+        let mut current = ContainerDetailData::new("container-0");
+        current.error = Some("current request".into());
+        controller.handle(LoopEvent::DetailLoaded {
+            generation: 2,
+            host: 0,
+            pane: DetailPane::Overview,
+            data: Box::new(current),
+        });
+        assert!(!controller.is_loading_detail);
+        assert_eq!(
+            controller
+                .snapshot()
+                .detail
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("current request")
+        );
+    }
+
+    #[test]
+    fn changing_selection_starts_a_new_detail_load_without_waiting_for_the_old_one() {
+        let mut controller = controller();
+        controller.state.detail_pane = DetailPane::Overview;
+        controller.detail_key = Some("other-container:Overview".into());
+        controller.detail_generation = 1;
+        controller.is_loading_detail = true;
+        controller.load_detail_if_needed(false);
+        assert_eq!(controller.detail_generation, 2);
+        assert_eq!(
+            controller.detail_key.as_deref(),
+            Some("container-0:Overview")
+        );
+    }
 }
