@@ -146,10 +146,9 @@ pub fn items(tab: Tab, snapshot: &DockerSnapshot, state: &AppState) -> Vec<ListI
             images.sort_by(|a, b| match state.sort_key {
                 SortKey::Created => directed(a.created.cmp(&b.created), state.sort_descending),
                 SortKey::Memory => directed(a.size.cmp(&b.size), state.sort_descending),
-                _ => a
-                    .display_name()
-                    .cmp(&b.display_name())
-                    .then_with(|| a.id.cmp(&b.id)),
+                SortKey::Name => directed(by_name(a, b), state.sort_descending),
+                // Keys that do not apply to images (CPU, status…) list them A→Z.
+                _ => by_name(a, b),
             });
             images.into_iter().map(ListItem::Image).collect()
         }
@@ -189,6 +188,12 @@ pub fn items(tab: Tab, snapshot: &DockerSnapshot, state: &AppState) -> Vec<ListI
             volumes.into_iter().map(ListItem::Volume).collect()
         }
     }
+}
+
+fn by_name(a: &DockerImage, b: &DockerImage) -> Ordering {
+    a.display_name()
+        .cmp(&b.display_name())
+        .then_with(|| a.id.cmp(&b.id))
 }
 
 fn directed(ordering: Ordering, descending: bool) -> Ordering {

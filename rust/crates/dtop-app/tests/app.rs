@@ -402,6 +402,37 @@ fn status_and_text_filters_combine() {
 }
 
 #[test]
+fn image_names_follow_the_sort_direction() {
+    let s = DockerSnapshot {
+        images: vec![
+            DockerImage::new("sha256:b", &["beta:1"], 1),
+            DockerImage::new("sha256:a", &["alpha:1"], 2),
+        ],
+        ..DockerSnapshot::default()
+    };
+    let mut state = AppState {
+        sort_key: SortKey::Name,
+        sort_descending: false,
+        ..AppState::default()
+    };
+    assert_eq!(
+        names(&list::items(Tab::Images, &s, &state)),
+        vec!["alpha:1", "beta:1"]
+    );
+    state.sort_descending = true;
+    assert_eq!(
+        names(&list::items(Tab::Images, &s, &state)),
+        vec!["beta:1", "alpha:1"]
+    );
+    // Keys that do not apply to images keep them A→Z whatever the direction.
+    state.sort_key = SortKey::Cpu;
+    assert_eq!(
+        names(&list::items(Tab::Images, &s, &state)),
+        vec!["alpha:1", "beta:1"]
+    );
+}
+
+#[test]
 fn compose_tab_nests_containers_and_honours_collapse() {
     let s = snapshot();
     let mut state = AppState::default();
@@ -975,6 +1006,49 @@ fn once_report_prints_a_stable_table_and_host_sections() {
         80,
     );
     assert!(multi.contains("== a ==") && multi.contains("== b ==\ndtop: down"));
+}
+
+#[test]
+fn once_report_neutralizes_escape_sequences_from_the_daemon() {
+    let mut s = snapshot();
+    s.endpoint = "unix:///x\u{1b}]0;title\u{7}".into();
+    s.containers = vec![compose(
+        "fff",
+        "evil\u{1b}[2J",
+        "proj\nfake-row running 99.0",
+        "svc",
+        ContainerState::Running,
+    )];
+    let text = once::render(&s, 200);
+    assert!(
+        !text.chars().any(|c| c.is_control() && c != '\n'),
+        "{text:?}"
+    );
+    // Header, blank line, column titles, one row: no forged line.
+    assert_eq!(text.lines().count(), 5, "{text}");
+    assert!(text.contains("evil\u{FFFD}[2J"));
+
+    let multi = once::render_hosts(
+        &[
+            ("a\u{1b}[31m".into(), s),
+            (
+                "b".into(),
+                DockerSnapshot {
+                    connection: ConnectionState::Disconnected {
+                        message: "down\u{1b}[2J\nforged".into(),
+                        retry_at: None,
+                    },
+                    ..DockerSnapshot::default()
+                },
+            ),
+        ],
+        200,
+    );
+    assert!(
+        !multi.chars().any(|c| c.is_control() && c != '\n'),
+        "{multi:?}"
+    );
+    assert!(multi.contains("dtop: down\u{FFFD}[2J\u{FFFD}forged\n"));
 }
 
 // MARK: - Refresher

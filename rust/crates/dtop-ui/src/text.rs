@@ -34,7 +34,7 @@ fn is_wide(v: u32) -> bool {
 /// Width of one scalar.
 pub fn char_width(c: char) -> usize {
     let v = c as u32;
-    if v == 0 || v < 0x20 || (0x7F..0xA0).contains(&v) || is_zero_width(v) {
+    if v < 0x20 || (0x7F..0xA0).contains(&v) || is_zero_width(v) {
         0
     } else if is_wide(v) {
         2
@@ -62,14 +62,28 @@ fn is_modifier(c: char) -> bool {
     matches!(c as u32, 0x1F3FB..=0x1F3FF)
 }
 
-/// Splits text into clusters.
+/// Characters that must never reach the terminal: controls (C0, DEL, C1 — ESC, CSI, newlines…)
+/// move the cursor or start escape sequences, and bidirectional marks, embeddings, overrides and
+/// isolates make text appear reordered.
+pub fn is_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Splits text into clusters. An unsafe character (see `is_unsafe`) is always a cluster of its
+/// own, taking no columns, so drawing skips it and nothing can attach to it or hide it inside a
+/// visible cluster.
 pub fn clusters(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start: Option<usize> = None;
     let mut previous_zwj = false;
+    let mut previous_unsafe = false;
     for (index, c) in text.char_indices() {
-        let attaches =
-            start.is_some() && (previous_zwj || (char_width(c) == 0 && c >= ' ') || is_modifier(c));
+        let unsafe_char = is_unsafe(c);
+        let attaches = start.is_some()
+            && !unsafe_char
+            && !previous_unsafe
+            && (previous_zwj || char_width(c) == 0 || is_modifier(c));
         if !attaches {
             if let Some(s) = start {
                 out.push(&text[s..index]);
@@ -77,11 +91,28 @@ pub fn clusters(text: &str) -> Vec<&str> {
             start = Some(index);
         }
         previous_zwj = c == '\u{200D}';
+        previous_unsafe = unsafe_char;
     }
     if let Some(s) = start {
         out.push(&text[s..]);
     }
     out
+}
+
+/// Text from outside dtop (container names, labels, daemon messages) made safe to print: tabs
+/// become a space and every other unsafe character (see `is_unsafe`) becomes U+FFFD, so it
+/// cannot move the cursor, clear the screen, start a new line or reorder the text around it.
+pub fn sanitize(text: &str) -> String {
+    if !text.chars().any(is_unsafe) {
+        return text.to_string();
+    }
+    text.chars()
+        .map(|c| match c {
+            '\t' => ' ',
+            c if is_unsafe(c) => '\u{FFFD}',
+            c => c,
+        })
+        .collect()
 }
 
 /// Columns `text` occupies.
@@ -206,6 +237,31 @@ mod tests {
         assert_eq!(width("👨‍👩‍👧"), 2);
         assert_eq!(width("\u{2764}\u{FE0F}"), 2);
         assert_eq!(clusters("a👨‍👩‍👧b").len(), 3);
+    }
+
+    #[test]
+    fn sanitizes_control_characters() {
+        assert_eq!(sanitize("plain · 日本"), "plain · 日本");
+        assert_eq!(sanitize("a\tb"), "a b");
+        assert_eq!(
+            sanitize("x\u{1b}[2Jy\nz\r"),
+            "x\u{FFFD}[2Jy\u{FFFD}z\u{FFFD}"
+        );
+        assert_eq!(sanitize("\u{9b}31m\u{7f}"), "\u{FFFD}31m\u{FFFD}");
+        assert_eq!(sanitize("a\u{202E}b"), "a\u{FFFD}b");
+        assert_eq!(width(&sanitize("\u{1b}x")), 2);
+    }
+
+    #[test]
+    fn unsafe_characters_never_join_a_visible_cluster() {
+        assert_eq!(clusters("a\u{9b}b"), vec!["a", "\u{9b}", "b"]);
+        assert_eq!(clusters("\u{1b}\u{FE0F}"), vec!["\u{1b}", "\u{FE0F}"]);
+        assert_eq!(clusters("x\u{200D}\u{1b}"), vec!["x\u{200D}", "\u{1b}"]);
+        assert_eq!(clusters("a\u{202E}b"), vec!["a", "\u{202E}", "b"]);
+        assert_eq!(cluster_width("\u{1b}"), 0);
+        assert_eq!(width("a\u{7f}\u{9b}b"), 2);
+        // Ordinary combining sequences are unchanged.
+        assert_eq!(clusters("e\u{301}x"), vec!["e\u{301}", "x"]);
     }
 
     #[test]

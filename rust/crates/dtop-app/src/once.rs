@@ -1,4 +1,6 @@
 //! `dtop --once`: a plain-text snapshot with no escape codes and a stable layout, safe to pipe.
+//! Everything that comes from the daemon (names, labels, versions, errors) passes through
+//! `text::sanitize`, so a crafted label cannot emit escape sequences or forge report lines.
 
 use dtop_core::format;
 use dtop_ui::text::{self, Alignment};
@@ -16,14 +18,14 @@ pub fn render_hosts(hosts: &[(String, DockerSnapshot)], width: usize) -> String 
     }
     hosts
         .iter()
-        .map(|(name, s)| format!("== {name} ==\n{}", render(s, width)))
+        .map(|(name, s)| format!("== {} ==\n{}", text::sanitize(name), render(s, width)))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 pub fn render(snapshot: &DockerSnapshot, width: usize) -> String {
     if let ConnectionState::Disconnected { message, .. } = &snapshot.connection {
-        return format!("dtop: {message}\n");
+        return format!("dtop: {}\n", text::sanitize(message));
     }
     let mut lines = Vec::new();
     let mut header = format!("dtop {APP_VERSION} · {}", snapshot.endpoint);
@@ -86,7 +88,7 @@ pub fn render(snapshot: &DockerSnapshot, width: usize) -> String {
         let text: Vec<String> = columns
             .iter()
             .zip(cells)
-            .map(|((_, w, a), c)| text::fit(c, *w, *a))
+            .map(|((_, w, a), c)| text::fit(&text::sanitize(c), *w, *a))
             .collect();
         text::prefix(&text.join(" "), width)
             .trim_end_matches(' ')
@@ -126,5 +128,7 @@ pub fn render(snapshot: &DockerSnapshot, width: usize) -> String {
     if snapshot.containers.is_empty() {
         lines.push("(no containers)".into());
     }
+    // Header, GPU names and issues come from the daemon and the GPU tools too.
+    let lines: Vec<String> = lines.iter().map(|l| text::sanitize(l)).collect();
     lines.join("\n") + "\n"
 }

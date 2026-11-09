@@ -14,14 +14,16 @@ pub struct ThemeLoader {
 }
 
 impl ThemeLoader {
-    /// Built-in names plus `*.theme` files in the themes directory.
+    /// Built-in names plus `*.theme` files in the themes directory. File names keep their case,
+    /// so each listed name loads its file on case-sensitive file systems; files that a built-in
+    /// name (matched case-insensitively, as `load` does) would shadow are left out.
     pub fn available_names(&self, list_directory: &dyn Fn(&str) -> Vec<String>) -> Vec<String> {
         let mut names: Vec<String> = Theme::built_in().into_iter().map(|t| t.name).collect();
         if let Some(directory) = &self.themes_directory {
             let mut custom: Vec<String> = list_directory(directory)
                 .into_iter()
-                .filter_map(|f| f.strip_suffix(".theme").map(str::to_lowercase))
-                .filter(|n| !names.contains(n))
+                .filter_map(|f| f.strip_suffix(".theme").map(str::to_string))
+                .filter(|n| !n.trim().is_empty() && Theme::named(n).is_none())
                 .collect();
             custom.sort();
             custom.dedup();
@@ -301,5 +303,32 @@ mod tests {
         assert_eq!(loaded.name, "mine");
         assert!(loader.load("nope", &|_| None).is_err());
         assert_eq!(base_name(r"C:\t\x.theme", Platform::Windows), "x");
+    }
+
+    #[test]
+    fn listed_custom_themes_keep_their_file_name_case() {
+        let fs = MemoryFs(RefCell::new(BTreeMap::new()));
+        let mut theme = Theme::harbor();
+        theme.name = "Ocean".into();
+        fs.write("/t/Ocean.theme", &serialize_theme(&theme))
+            .unwrap();
+        let loader = ThemeLoader {
+            themes_directory: Some("/t".into()),
+            platform: Platform::Linux,
+        };
+        let listing = |_: &str| {
+            vec![
+                "Ocean.theme".to_string(),
+                "Harbor.theme".to_string(),
+                "Default.theme".to_string(),
+                "notes.txt".to_string(),
+            ]
+        };
+        let names = loader.available_names(&listing);
+        assert!(names.contains(&"Ocean".to_string()), "{names:?}");
+        // Shadowed by the built-ins `harbor` and `default`, which `load` resolves first.
+        assert!(!names.iter().any(|n| n == "Harbor" || n == "Default"));
+        assert_eq!(names.last().map(String::as_str), Some("Ocean"));
+        assert!(loader.load("Ocean", &|p| fs.read(p)).is_ok());
     }
 }

@@ -21,6 +21,12 @@ pub trait Connection: Send + Sync {
     fn interrupt(&self);
     /// Releases the handle. Safe to call more than once.
     fn close(&self);
+    /// Lets later reads wait indefinitely (`interrupt` still wakes them), for long-lived
+    /// streams. Called once connection setup — TCP connect and any TLS handshake — finished
+    /// under the transport's finite timeout. Transports without read timeouts ignore it.
+    fn disable_read_timeout(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Opens connections to one endpoint.
@@ -34,6 +40,7 @@ pub(crate) trait ShutdownStream: Send + Sync {
     fn read_into(&self, buf: &mut [u8]) -> io::Result<usize>;
     fn write_from(&self, buf: &[u8]) -> io::Result<usize>;
     fn shutdown_both(&self);
+    fn clear_read_timeout(&self) -> io::Result<()>;
 }
 
 impl ShutdownStream for std::net::TcpStream {
@@ -45,6 +52,9 @@ impl ShutdownStream for std::net::TcpStream {
     }
     fn shutdown_both(&self) {
         let _ = self.shutdown(std::net::Shutdown::Both);
+    }
+    fn clear_read_timeout(&self) -> io::Result<()> {
+        self.set_read_timeout(None)
     }
 }
 
@@ -59,6 +69,9 @@ impl ShutdownStream for std::os::unix::net::UnixStream {
     fn shutdown_both(&self) {
         // shutdown() (unlike close()) reliably wakes a thread blocked in recv().
         let _ = self.shutdown(std::net::Shutdown::Both);
+    }
+    fn clear_read_timeout(&self) -> io::Result<()> {
+        self.set_read_timeout(None)
     }
 }
 
@@ -145,6 +158,12 @@ impl<S: ShutdownStream> Connection for StreamConnection<S> {
             self.stream.shutdown_both();
         }
     }
+
+    fn disable_read_timeout(&self) -> Result<()> {
+        self.stream
+            .clear_read_timeout()
+            .map_err(|e| DockerError::Io(format!("could not clear the read timeout: {e}")))
+    }
 }
 
 fn timeout(seconds: u64) -> Option<Duration> {
@@ -157,6 +176,7 @@ pub struct UnixSocketTransport {
     endpoint: DockerEndpoint,
     path: String,
     timeout_seconds: u64,
+    streaming: bool,
 }
 
 #[cfg(unix)]
@@ -166,7 +186,14 @@ impl UnixSocketTransport {
             endpoint: DockerEndpoint::UnixSocket(path.to_string()),
             path: path.to_string(),
             timeout_seconds,
+            streaming: false,
         }
+    }
+
+    /// For long-lived streams: setup keeps the timeout, reads afterwards wait indefinitely.
+    pub fn streaming(mut self) -> Self {
+        self.streaming = true;
+        self
     }
 }
 
@@ -190,7 +217,11 @@ impl Transport for UnixSocketTransport {
         })?;
         let _ = stream.set_read_timeout(timeout(self.timeout_seconds));
         let _ = stream.set_write_timeout(timeout(self.timeout_seconds));
-        Ok(Arc::new(StreamConnection::new(stream)))
+        let connection = Arc::new(StreamConnection::new(stream));
+        if self.streaming {
+            connection.disable_read_timeout()?;
+        }
+        Ok(connection)
     }
 }
 
@@ -247,6 +278,7 @@ pub struct TcpTransport {
     host: String,
     port: u16,
     timeout_seconds: u64,
+    streaming: bool,
 }
 
 impl TcpTransport {
@@ -259,7 +291,14 @@ impl TcpTransport {
             host: host.to_string(),
             port,
             timeout_seconds,
+            streaming: false,
         }
+    }
+
+    /// For long-lived streams: setup keeps the timeout, reads afterwards wait indefinitely.
+    pub fn streaming(mut self) -> Self {
+        self.streaming = true;
+        self
     }
 }
 
@@ -270,7 +309,11 @@ impl Transport for TcpTransport {
 
     fn connect(&self) -> Result<Arc<dyn Connection>> {
         let stream = connect_tcp(&self.host, self.port, self.timeout_seconds, &self.endpoint)?;
-        Ok(Arc::new(StreamConnection::new(stream)))
+        let connection = Arc::new(StreamConnection::new(stream));
+        if self.streaming {
+            connection.disable_read_timeout()?;
+        }
+        Ok(connection)
     }
 }
 
@@ -279,11 +322,33 @@ pub fn make_transport(
     endpoint: &DockerEndpoint,
     timeout_seconds: u64,
 ) -> Result<Arc<dyn Transport>> {
+    build_transport(endpoint, timeout_seconds, false)
+}
+
+/// Like `make_transport`, for long-lived streams (`/events`, `logs -f`): connecting still times
+/// out after `setup_timeout_seconds`, then reads wait indefinitely.
+pub fn make_streaming_transport(
+    endpoint: &DockerEndpoint,
+    setup_timeout_seconds: u64,
+) -> Result<Arc<dyn Transport>> {
+    build_transport(endpoint, setup_timeout_seconds, true)
+}
+
+fn build_transport(
+    endpoint: &DockerEndpoint,
+    timeout_seconds: u64,
+    streaming: bool,
+) -> Result<Arc<dyn Transport>> {
     match endpoint {
         DockerEndpoint::UnixSocket(path) => {
             #[cfg(unix)]
             {
-                Ok(Arc::new(UnixSocketTransport::new(path, timeout_seconds)))
+                let transport = UnixSocketTransport::new(path, timeout_seconds);
+                Ok(Arc::new(if streaming {
+                    transport.streaming()
+                } else {
+                    transport
+                }))
             }
             #[cfg(not(unix))]
             {
@@ -293,12 +358,18 @@ pub fn make_transport(
             }
         }
         DockerEndpoint::Tcp { host, port } => {
-            Ok(Arc::new(TcpTransport::new(host, *port, timeout_seconds)))
+            let transport = TcpTransport::new(host, *port, timeout_seconds);
+            Ok(Arc::new(if streaming {
+                transport.streaming()
+            } else {
+                transport
+            }))
         }
         DockerEndpoint::NamedPipe(path) => {
             #[cfg(windows)]
             {
-                let _ = timeout_seconds;
+                // Pipes have no timeouts; streams are cancelled with CancelIoEx.
+                let _ = (timeout_seconds, streaming);
                 Ok(Arc::new(windows_pipe::NamedPipeTransport::new(path)))
             }
             #[cfg(not(windows))]

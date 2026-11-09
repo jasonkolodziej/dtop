@@ -1,7 +1,8 @@
 //! What to do with the followed log stream when the selection, pane, host or the stream itself
 //! changes. Pure, so the rules are tested without a terminal.
 
-use dtop_core::logstream::LogLine;
+use dtop_core::logstream::{LogLine, LogStreamKind};
+use dtop_core::timestamp::Timestamp;
 
 use crate::state::LogStreamState;
 
@@ -25,15 +26,59 @@ pub enum Decision {
     Wait,
 }
 
-/// Lines of a resumed stream that are new. `since` is inclusive, so lines at or before the last
-/// shown one are dropped; lines without a timestamp are kept.
-pub fn new_lines(batch: Vec<LogLine>, after: Option<f64>) -> Vec<LogLine> {
-    match after {
-        None => batch,
-        Some(last) => batch
+/// Where a resumed stream picks up: the last shown line's exact timestamp, and the lines shown
+/// at that very instant. Docker's `since` is inclusive, so the resumed stream repeats those
+/// boundary lines; each is skipped once, while other lines that share the instant (written
+/// after the stream dropped) are kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResumeCursor {
+    pub after: Timestamp,
+    /// Shown lines stamped exactly `after`, oldest first: (stream, text).
+    seen: Vec<(LogStreamKind, String)>,
+}
+
+impl ResumeCursor {
+    /// The cursor for lines already on screen, or None when the last one has no timestamp.
+    pub fn from_shown(lines: &[LogLine]) -> Option<ResumeCursor> {
+        let after = lines.last()?.timestamp?;
+        let mut seen: Vec<(LogStreamKind, String)> = lines
+            .iter()
+            .rev()
+            .take_while(|l| l.timestamp == Some(after))
+            .map(|l| (l.stream, l.text.clone()))
+            .collect();
+        seen.reverse();
+        Some(ResumeCursor { after, seen })
+    }
+
+    /// The lines of a resumed batch that are new. Stateful across batches: a boundary line is
+    /// skipped only once. Lines without a timestamp are kept.
+    pub fn new_lines(&mut self, batch: Vec<LogLine>) -> Vec<LogLine> {
+        batch
             .into_iter()
-            .filter(|l| l.timestamp.unwrap_or(f64::INFINITY) > last)
-            .collect(),
+            .filter(|line| match line.timestamp {
+                None => true,
+                Some(t) if t < self.after => false,
+                Some(t) if t == self.after => {
+                    match self
+                        .seen
+                        .iter()
+                        .position(|(stream, text)| *stream == line.stream && *text == line.text)
+                    {
+                        Some(index) => {
+                            self.seen.remove(index);
+                            false
+                        }
+                        None => true,
+                    }
+                }
+                Some(_) => {
+                    // Past the boundary: nothing more of it can arrive.
+                    self.seen.clear();
+                    true
+                }
+            })
+            .collect()
     }
 }
 
@@ -86,7 +131,6 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dtop_core::logstream::LogStreamKind;
 
     fn target(active: bool) -> Target {
         Target {
@@ -136,16 +180,59 @@ mod tests {
 
     #[test]
     fn resumed_streams_drop_lines_already_shown() {
-        let line = |t: Option<f64>| LogLine {
+        let at = |nanos| Timestamp {
+            seconds: 1_714_566_896,
+            nanos,
+        };
+        let line = |t: Option<Timestamp>, text: &str| LogLine {
             stream: LogStreamKind::Stdout,
-            text: String::new(),
+            text: text.into(),
             timestamp: t,
         };
-        let kept = new_lines(
-            vec![line(Some(1.0)), line(Some(2.0)), line(None)],
-            Some(1.0),
+        let shown = vec![line(Some(at(1)), "a"), line(Some(at(2)), "b")];
+        let mut cursor = ResumeCursor::from_shown(&shown).unwrap();
+        let kept = cursor.new_lines(vec![
+            line(Some(at(1)), "a"),
+            line(Some(at(2)), "b"),
+            line(Some(at(3)), "c"),
+            line(None, "d"),
+        ]);
+        assert_eq!(
+            kept.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["c", "d"]
         );
-        assert_eq!(kept.len(), 2);
         assert_eq!(scroll_back(10, 5, 12), 12);
+        assert_eq!(ResumeCursor::from_shown(&[line(None, "x")]), None);
+    }
+
+    #[test]
+    fn lines_a_nanosecond_apart_or_at_the_same_instant_are_not_lost() {
+        let at = |nanos| Timestamp {
+            seconds: 1_714_566_896,
+            nanos,
+        };
+        let line = |t: Timestamp, text: &str| LogLine {
+            stream: LogStreamKind::Stdout,
+            text: text.into(),
+            timestamp: Some(t),
+        };
+        // One line shown before the stream dropped; the next was written 1 ns later.
+        let mut cursor = ResumeCursor::from_shown(&[line(at(123_456_789), "first")]).unwrap();
+        let kept = cursor.new_lines(vec![
+            line(at(123_456_789), "first"),
+            line(at(123_456_790), "second"),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].text, "second");
+
+        // Two lines share the boundary instant but only one was shown; the resumed stream
+        // arrives in two batches.
+        let mut cursor = ResumeCursor::from_shown(&[line(at(5), "x")]).unwrap();
+        assert!(cursor.new_lines(vec![line(at(5), "x")]).is_empty());
+        let kept = cursor.new_lines(vec![line(at(5), "x"), line(at(5), "y")]);
+        assert_eq!(
+            kept.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["x", "y"]
+        );
     }
 }

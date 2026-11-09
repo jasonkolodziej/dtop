@@ -18,7 +18,7 @@ use crate::endpoint::DockerEndpoint;
 use crate::error::DockerError;
 use crate::error::Result;
 use crate::host::{DockerHost, TlsConfiguration};
-use crate::transport::{make_transport, Connection, Transport};
+use crate::transport::{make_streaming_transport, make_transport, Connection, Transport};
 
 /// A negotiated protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +42,10 @@ pub struct TlsTransport {
     pub host: String,
     pub port: u16,
     pub configuration: TlsConfiguration,
+    /// Bounds the TCP connect and the handshake, and (unless `streaming`) every later read.
     pub timeout_seconds: u64,
+    /// For long-lived streams: once the handshake is done, reads wait indefinitely.
+    pub streaming: bool,
 }
 
 impl TlsTransport {
@@ -61,7 +64,14 @@ impl TlsTransport {
             port,
             configuration,
             timeout_seconds,
+            streaming: false,
         }
+    }
+
+    /// For long-lived streams: setup keeps the timeout, reads afterwards wait indefinitely.
+    pub fn streaming(mut self) -> Self {
+        self.streaming = true;
+        self
     }
 
     /// The name the server certificate must match.
@@ -84,27 +94,57 @@ impl Transport for TlsTransport {
     }
 
     fn connect(&self) -> Result<Arc<dyn Connection>> {
-        self.connect_tls().map(|(c, _)| c)
+        let (connection, _) = self.connect_tls()?;
+        if self.streaming {
+            if let Err(error) = connection.disable_read_timeout() {
+                connection.close();
+                return Err(error);
+            }
+        }
+        Ok(connection)
     }
 }
 
 /// The transport for a host: TLS when it has TLS settings, otherwise its plain transport.
 pub fn make_host_transport(host: &DockerHost, timeout_seconds: u64) -> Result<Arc<dyn Transport>> {
-    if let (Some(tls), DockerEndpoint::Tcp { host: name, port }) = (&host.tls, &host.endpoint) {
-        return Ok(Arc::new(TlsTransport::new(
-            name,
-            *port,
-            tls.clone(),
-            timeout_seconds,
-        )));
-    }
-    make_transport(&host.endpoint, timeout_seconds)
+    host_transport(host, timeout_seconds, false)
 }
 
-/// A client for a host (TLS when the host asks for it), with a timeout-free streaming transport.
+/// The transport for a host's long-lived streams: connecting and the TLS handshake still time
+/// out after `setup_timeout_seconds` (a stalled peer cannot block the worker forever, and the
+/// stream's cancellation only takes effect once connected); then reads wait indefinitely.
+pub fn make_streaming_host_transport(
+    host: &DockerHost,
+    setup_timeout_seconds: u64,
+) -> Result<Arc<dyn Transport>> {
+    host_transport(host, setup_timeout_seconds, true)
+}
+
+fn host_transport(
+    host: &DockerHost,
+    timeout_seconds: u64,
+    streaming: bool,
+) -> Result<Arc<dyn Transport>> {
+    if let (Some(tls), DockerEndpoint::Tcp { host: name, port }) = (&host.tls, &host.endpoint) {
+        let transport = TlsTransport::new(name, *port, tls.clone(), timeout_seconds);
+        return Ok(Arc::new(if streaming {
+            transport.streaming()
+        } else {
+            transport
+        }));
+    }
+    if streaming {
+        make_streaming_transport(&host.endpoint, timeout_seconds)
+    } else {
+        make_transport(&host.endpoint, timeout_seconds)
+    }
+}
+
+/// A client for a host (TLS when the host asks for it). Its streaming transport keeps
+/// `timeout_seconds` for connecting and the handshake, and drops the read timeout afterwards.
 pub fn client_for_host(host: &DockerHost, timeout_seconds: u64) -> Result<DockerClient> {
     let transport = make_host_transport(host, timeout_seconds)?;
-    let streaming = make_host_transport(host, 0)?;
+    let streaming = make_streaming_host_transport(host, timeout_seconds)?;
     Ok(DockerClient::new(transport, Some(streaming)))
 }
 
@@ -277,6 +317,95 @@ mod backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// A peer that accepts one TCP connection and then says nothing until the returned sender
+    /// is dropped.
+    fn silent_peer() -> (u16, mpsc::Sender<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stop, stopped) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = stopped.recv_timeout(Duration::from_secs(30));
+            drop(stream);
+        });
+        (port, stop)
+    }
+
+    fn tls_host(port: u16) -> DockerHost {
+        let mut host = DockerHost::new(
+            "stalled",
+            DockerEndpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port,
+            },
+        );
+        host.tls = Some(TlsConfiguration::default());
+        host
+    }
+
+    #[test]
+    fn streaming_transports_keep_a_deadline_for_the_tls_handshake() {
+        let (port, peer) = silent_peer();
+        let transport = make_streaming_host_transport(&tls_host(port), 1).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(transport.connect().map(|_| ()));
+        });
+        // The handshake stalls; it must fail on the setup deadline (Network.framework adds a
+        // grace period), not wait for the peer.
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(7))
+            .expect("the handshake blocked past its deadline");
+        // Without a TLS library the connect fails earlier, which is fine for this check.
+        assert!(outcome.is_err());
+        assert!(started.elapsed() < Duration::from_secs(7));
+        drop(peer);
+    }
+
+    #[test]
+    fn streaming_transports_wait_indefinitely_once_connected() {
+        let (port, peer) = silent_peer();
+        let endpoint = DockerEndpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let host = DockerHost::new("plain", endpoint);
+        let connection = make_streaming_host_transport(&host, 1)
+            .unwrap()
+            .connect()
+            .unwrap();
+        let reader = Arc::clone(&connection);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(reader.read(16));
+        });
+        // Well past the one-second setup timeout, the read is still waiting…
+        assert!(rx.recv_timeout(Duration::from_millis(2500)).is_err());
+        // …until the stream is cancelled.
+        connection.interrupt();
+        let read = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(read, Ok(ref b) if b.is_empty()) || read.is_err());
+
+        // A request transport keeps its read timeout.
+        let (port, peer2) = silent_peer();
+        let host = DockerHost::new(
+            "plain",
+            DockerEndpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port,
+            },
+        );
+        let connection = make_host_transport(&host, 1).unwrap().connect().unwrap();
+        assert!(matches!(
+            connection.read(16),
+            Err(crate::error::DockerError::TimedOut(_))
+        ));
+        drop((peer, peer2));
+    }
 
     #[test]
     fn recognizes_ip_literals() {

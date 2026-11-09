@@ -1361,6 +1361,11 @@ impl Connection for SChannelConnection {
         Ok(session.plaintext.drain(..count).collect())
     }
 
+    fn disable_read_timeout(&self) -> Result<()> {
+        // Reads wait on the TCP socket underneath.
+        self.underlying.disable_read_timeout()
+    }
+
     fn interrupt(&self) {
         self.underlying.interrupt();
     }

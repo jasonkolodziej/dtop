@@ -882,8 +882,8 @@ impl AppController {
         let mut detail = existing.unwrap_or_else(|| ContainerDetailData::new(&wanted.container_id));
         // Same container as before (a reconnect, or it started again): keep what is on screen and
         // resume from the last line's timestamp instead of re-reading the tail.
-        let resume_after = detail.logs.last().and_then(|l| l.timestamp);
-        if resume_after.is_none() {
+        let mut resume = log_policy::ResumeCursor::from_shown(&detail.logs);
+        if resume.is_none() {
             detail.logs.clear();
             self.state.detail_scroll = 0;
             self.state.log_follow = true;
@@ -891,7 +891,11 @@ impl AppController {
         detail.log_state = LogStreamState::Live;
         self.snapshot_mut().detail = Some(detail);
         let api = Arc::clone(&self.sessions[wanted.host].connection.api);
-        let subscription = api.follow_logs(&wanted.container_id, self.log_tail, resume_after);
+        let subscription = api.follow_logs(
+            &wanted.container_id,
+            self.log_tail,
+            resume.as_ref().map(|r| r.after),
+        );
         let cancelled = Arc::new(AtomicBool::new(false));
         self.log_generation = self.log_generation.wrapping_add(1);
         let generation = self.log_generation;
@@ -911,7 +915,10 @@ impl AppController {
                 match subscription.receiver.recv() {
                     Ok(StreamItem::Item(batch)) => {
                         // `since` is inclusive: drop lines already shown.
-                        let fresh = log_policy::new_lines(batch, resume_after);
+                        let fresh = match resume.as_mut() {
+                            Some(cursor) => cursor.new_lines(batch),
+                            None => batch,
+                        };
                         if !fresh.is_empty() && !cancelled.load(Ordering::SeqCst) {
                             let event = LoopEvent::LogLines {
                                 generation,

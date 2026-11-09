@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -693,7 +694,10 @@ impl Handle {
 pub struct AppleTlsConnection {
     connection: Handle,
     queue: Handle,
+    /// Bounds the handshake and writes.
     timeout_seconds: u64,
+    /// Bounds reads; 0 (no limit) once `disable_read_timeout` is called for a stream.
+    read_timeout_seconds: AtomicU64,
     configuration: TlsConfiguration,
     endpoint: String,
     server_name: String,
@@ -800,6 +804,7 @@ impl AppleTlsConnection {
                 connection: Handle(connection),
                 queue: Handle(queue),
                 timeout_seconds,
+                read_timeout_seconds: AtomicU64::new(timeout_seconds),
                 configuration: configuration.clone(),
                 endpoint: endpoint.into(),
                 server_name: server_name.into(),
@@ -1052,8 +1057,8 @@ impl Connection for AppleTlsConnection {
             );
             drop(Box::from_raw(completion));
         }
-        let Some((data, error)) =
-            done.wait(self.timeout_seconds, || self.current_failure().is_some())
+        let read_timeout = self.read_timeout_seconds.load(Ordering::SeqCst);
+        let Some((data, error)) = done.wait(read_timeout, || self.current_failure().is_some())
         else {
             self.cancel();
             if let Some(failure) = self.current_failure() {
@@ -1093,6 +1098,11 @@ impl Connection for AppleTlsConnection {
             Some(e) => Err(self.describe(&e, false)),
             None => Ok(Vec::new()),
         }
+    }
+
+    fn disable_read_timeout(&self) -> Result<()> {
+        self.read_timeout_seconds.store(0, Ordering::SeqCst);
+        Ok(())
     }
 
     fn interrupt(&self) {

@@ -58,6 +58,11 @@ impl ApiVersion {
         major: 1,
         minor: 47,
     };
+    /// `volumes/prune` only removes anonymous volumes (and accepts the `all` filter) from 1.42.
+    pub const ANONYMOUS_VOLUME_PRUNE: ApiVersion = ApiVersion {
+        major: 1,
+        minor: 42,
+    };
     /// `stats?one-shot=true` arrived in 1.41.
     pub const ONE_SHOT_STATS: ApiVersion = ApiVersion {
         major: 1,
@@ -189,7 +194,12 @@ pub trait DockerApi: Send + Sync {
     /// The last `tail` lines (or, with `since`, every line from that time on), then every new
     /// line as the container writes it (`logs -f`). Lines carry timestamps. Ends when the
     /// container stops or the subscription is cancelled. The default fetches once.
-    fn follow_logs(&self, id: &str, tail: usize, since: Option<f64>) -> Subscription<Vec<LogLine>> {
+    fn follow_logs(
+        &self,
+        id: &str,
+        tail: usize,
+        since: Option<crate::timestamp::Timestamp>,
+    ) -> Subscription<Vec<LogLine>> {
         let _ = since;
         match self.logs(id, tail) {
             Ok(lines) => Subscription::from_items(vec![lines], None),

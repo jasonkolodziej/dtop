@@ -24,6 +24,8 @@ pub enum DockerError {
     TimedOut(String),
     /// TLS setup or handshake failed. The message says what was wrong and how to fix it.
     Tls(String),
+    /// dtop refused an operation this daemon cannot perform safely. The message says why.
+    Unsupported(String),
 }
 
 impl fmt::Display for DockerError {
@@ -76,6 +78,7 @@ impl fmt::Display for DockerError {
                 "Timed out waiting for Docker during {operation} — the daemon may be overloaded"
             ),
             DockerError::Tls(reason) => write!(f, "TLS error: {reason}"),
+            DockerError::Unsupported(reason) => write!(f, "{reason}"),
         }
     }
 }

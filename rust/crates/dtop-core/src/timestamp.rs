@@ -1,7 +1,38 @@
 //! Docker's RFC 3339 timestamps (`2024-05-01T12:34:56.123456789Z`, optional offsets) as seconds
 //! since the Unix epoch, keeping sub-second precision. Docker's zero time (`0001-01-01…`) is None.
 
+use std::fmt;
+
+/// An exact instant: whole seconds since the epoch plus nanoseconds. Log cursors need this:
+/// an `f64` near today's epoch only resolves about 240 ns, so distinct log lines written a
+/// nanosecond apart would compare equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp {
+    pub seconds: i64,
+    /// 0..1_000_000_000
+    pub nanos: u32,
+}
+
+impl Timestamp {
+    pub fn as_f64(self) -> f64 {
+        self.seconds as f64 + f64::from(self.nanos) / 1_000_000_000.0
+    }
+}
+
+/// Docker's `seconds.nanoseconds` form for `since`/`until`, exact to the nanosecond.
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{:09}", self.seconds, self.nanos)
+    }
+}
+
+/// Seconds since the epoch, as a float (for rates and ages, where nanoseconds do not matter).
 pub fn parse(text: &str) -> Option<f64> {
+    parse_exact(text).map(Timestamp::as_f64)
+}
+
+/// The exact instant; digits beyond nanoseconds are ignored.
+pub fn parse_exact(text: &str) -> Option<Timestamp> {
     let b = text.as_bytes();
     if b.len() < 20 {
         return None;
@@ -39,13 +70,13 @@ pub fn parse(text: &str) -> Option<f64> {
         return None;
     }
     let mut index = 19;
-    let mut fraction = 0.0;
+    let mut nanos: u32 = 0;
     if b.get(index) == Some(&b'.') {
         index += 1;
-        let mut scale = 0.1;
+        let mut scale: u32 = 100_000_000;
         while let Some(c) = b.get(index).filter(|c| c.is_ascii_digit()) {
-            fraction += f64::from(c - b'0') * scale;
-            scale /= 10.0;
+            nanos += u32::from(c - b'0') * scale;
+            scale /= 10;
             index += 1;
         }
     }
@@ -68,7 +99,7 @@ pub fn parse(text: &str) -> Option<f64> {
     };
     let days = days_from_civil(year, month, day);
     let seconds = days * 86_400 + hour * 3600 + minute * 60 + second - offset;
-    Some(seconds as f64 + fraction)
+    Some(Timestamp { seconds, nanos })
 }
 
 /// Days in `month` (1–12) of `year`, proleptic Gregorian.
@@ -102,6 +133,29 @@ mod tests {
         let t = parse("2024-05-01T12:34:56.5Z").unwrap();
         assert!((t - 1_714_566_896.5).abs() < 1e-6);
         assert_eq!(parse("1970-01-01T01:00:00+01:00"), Some(0.0));
+    }
+
+    #[test]
+    fn keeps_every_nanosecond() {
+        let a = parse_exact("2024-05-01T12:34:56.123456789Z").unwrap();
+        let b = parse_exact("2024-05-01T12:34:56.123456790Z").unwrap();
+        assert_eq!(a.nanos, 123_456_789);
+        assert!(a < b);
+        assert_eq!(a.to_string(), "1714566896.123456789");
+        assert_eq!(
+            parse_exact("2024-05-01T12:34:56Z").unwrap().to_string(),
+            "1714566896.000000000"
+        );
+        assert_eq!(
+            parse_exact("2024-05-01T12:34:56.1234567891Z")
+                .unwrap()
+                .nanos,
+            123_456_789
+        );
+        assert_eq!(
+            parse_exact("2024-05-01T12:34:56.5Z").unwrap().nanos,
+            500_000_000
+        );
     }
 
     #[test]

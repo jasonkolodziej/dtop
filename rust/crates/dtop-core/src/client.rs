@@ -9,6 +9,7 @@ use crate::http::{percent_encode, HttpClient, Method, Request, Response, Respons
 use crate::json::{self, Value};
 use crate::logstream::{DecoderMode, JsonLineSplitter, LogLine, LogStreamDecoder};
 use crate::models::*;
+use crate::timestamp::Timestamp;
 use crate::transport::Transport;
 
 #[derive(Clone)]
@@ -93,15 +94,15 @@ impl DockerClient {
         format!("/containers/{}{suffix}", Self::path_segment(id))
     }
 
-    /// Docker's `seconds.nanoseconds` form for `since`/`until`.
-    pub fn unix_timestamp(time: f64) -> String {
-        let mut seconds = time.floor() as i64;
-        let mut nanos = ((time - seconds as f64) * 1_000_000_000.0).round() as i64;
-        if nanos >= 1_000_000_000 {
-            seconds += 1;
-            nanos -= 1_000_000_000;
-        }
-        format!("{seconds}.{nanos:09}")
+    fn named_volume_prune_refusal(version: Option<ApiVersion>) -> DockerError {
+        let daemon = version.map_or_else(
+            || "This Docker daemon".to_string(),
+            |v| format!("This Docker daemon (API {v})"),
+        );
+        DockerError::Unsupported(format!(
+            "{daemon} would also delete unused named volumes when pruning, so dtop did not prune — \
+             remove anonymous volumes one at a time, or upgrade to Docker Engine 23.0 (API 1.42) or newer"
+        ))
     }
 }
 
@@ -197,7 +198,12 @@ impl DockerApi for DockerClient {
         Ok(lines)
     }
 
-    fn follow_logs(&self, id: &str, tail: usize, since: Option<f64>) -> Subscription<Vec<LogLine>> {
+    fn follow_logs(
+        &self,
+        id: &str,
+        tail: usize,
+        since: Option<Timestamp>,
+    ) -> Subscription<Vec<LogLine>> {
         let mut query: Vec<(&str, Option<String>)> = vec![
             ("follow", Some("1".into())),
             ("stdout", Some("1".into())),
@@ -207,7 +213,8 @@ impl DockerApi for DockerClient {
         match since {
             // Resuming: everything from that instant on (inclusive; callers drop what they have).
             Some(since) => {
-                query.push(("since", Some(Self::unix_timestamp(since))));
+                // `seconds.nanoseconds`, exact: a rounded cursor could skip or repeat lines.
+                query.push(("since", Some(since.to_string())));
                 query.push(("tail", Some("all".into())));
             }
             None => query.push(("tail", Some(tail.to_string()))),
@@ -352,8 +359,30 @@ impl DockerApi for DockerClient {
     }
 
     fn prune_volumes(&self) -> Result<PruneReport> {
-        // API >= 1.42 only prunes anonymous volumes unless asked; dtop keeps that safer default.
-        Ok(PruneReport::decode(&self.post_json("/volumes/prune", &[])?))
+        // Before API 1.42 a prune also deletes unused *named* volumes, and there is no filter
+        // that selects anonymous ones only. dtop promises anonymous-only, so it refuses there.
+        // An unnegotiated client asks the daemon which version it speaks first.
+        let version = match self.api_version {
+            Some(v) => Some(v),
+            None => self.ping()?,
+        };
+        if let Some(v) = version.filter(|v| *v < ApiVersion::ANONYMOUS_VOLUME_PRUNE) {
+            return Err(Self::named_volume_prune_refusal(Some(v)));
+        }
+        // `all=false` states the 1.42+ default explicitly. A daemon too old to know the filter
+        // (one whose version was not reported) rejects the request instead of deleting named
+        // volumes.
+        let query = [("filters", Some(r#"{"all":["false"]}"#.to_string()))];
+        match self.post_json("/volumes/prune", &query) {
+            Ok(v) => Ok(PruneReport::decode(&v)),
+            Err(DockerError::Http {
+                status: 400,
+                message,
+            }) if message.to_ascii_lowercase().contains("invalid filter") => {
+                Err(Self::named_volume_prune_refusal(None))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn events(&self) -> Subscription<DockerEvent> {
@@ -436,10 +465,14 @@ mod tests {
     }
 
     #[test]
-    fn formats_since_timestamps() {
-        assert_eq!(DockerClient::unix_timestamp(12.5), "12.500000000");
-        assert_eq!(DockerClient::unix_timestamp(3.0), "3.000000000");
-        assert_eq!(DockerClient::unix_timestamp(1.9999999999), "2.000000000");
+    fn formats_since_timestamps_exactly() {
+        let at = |seconds, nanos| Timestamp { seconds, nanos };
+        assert_eq!(at(12, 500_000_000).to_string(), "12.500000000");
+        assert_eq!(at(3, 0).to_string(), "3.000000000");
+        assert_eq!(
+            at(1_714_566_896, 123_456_789).to_string(),
+            "1714566896.123456789"
+        );
     }
 
     #[test]
@@ -471,5 +504,90 @@ mod tests {
                 message: "Not Found".into()
             }
         );
+    }
+
+    /// Status, body and extra headers of one scripted reply.
+    type Reply = (u16, &'static str, Vec<(&'static str, &'static str)>);
+
+    /// Serves one scripted response per connection and records each request line.
+    fn scripted_server(responses: Vec<Reply>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body, headers) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+                    head.push(byte[0]);
+                }
+                let text = String::from_utf8_lossy(&head).into_owned();
+                requests.push(text.lines().next().unwrap_or_default().to_string());
+                let mut reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+                    body.len()
+                );
+                for (name, value) in headers {
+                    reply.push_str(&format!("{name}: {value}\r\n"));
+                }
+                reply.push_str("Connection: close\r\n\r\n");
+                reply.push_str(body);
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+            requests
+        });
+        (port, handle)
+    }
+
+    fn client(port: u16) -> DockerClient {
+        let transport = Arc::new(crate::transport::TcpTransport::new("127.0.0.1", port, 5));
+        DockerClient::new(transport, None)
+    }
+
+    #[test]
+    fn volume_prune_is_refused_before_api_1_42() {
+        // Negotiated to an old version: refused without a request.
+        let mut old = client(1);
+        old.api_version = ApiVersion::parse("1.41");
+        assert!(matches!(
+            old.prune_volumes(),
+            Err(DockerError::Unsupported(_))
+        ));
+
+        // Unnegotiated: the ping reports 1.41, so nothing is pruned.
+        let (port, server) = scripted_server(vec![(200, "OK", vec![("API-Version", "1.41")])]);
+        let error = client(port).prune_volumes().unwrap_err();
+        assert!(error.to_string().contains("named volumes"), "{error}");
+        assert_eq!(server.join().unwrap(), vec!["GET /_ping HTTP/1.1"]);
+    }
+
+    #[test]
+    fn volume_prune_selects_anonymous_volumes_explicitly() {
+        let (port, server) = scripted_server(vec![
+            (200, "OK", vec![("API-Version", "1.47")]),
+            (
+                200,
+                r#"{"VolumesDeleted":["a"],"SpaceReclaimed":5}"#,
+                vec![],
+            ),
+        ]);
+        let report = client(port).prune_volumes().unwrap();
+        assert_eq!(report.space_reclaimed, 5);
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests[1],
+            "POST /volumes/prune?filters=%7B%22all%22%3A%5B%22false%22%5D%7D HTTP/1.1"
+        );
+
+        // A daemon that reports no version and does not know the filter: refused, not pruned.
+        let (port, server) = scripted_server(vec![
+            (200, "OK", vec![]),
+            (400, r#"{"message":"Invalid filter 'all'"}"#, vec![]),
+        ]);
+        let error = client(port).prune_volumes().unwrap_err();
+        assert!(matches!(error, DockerError::Unsupported(_)), "{error}");
+        server.join().unwrap();
     }
 }

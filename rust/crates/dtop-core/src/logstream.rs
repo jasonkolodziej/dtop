@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::{DockerError, Result};
-use crate::timestamp;
+use crate::timestamp::{self, Timestamp};
 
 /// Splits a byte stream into newline-delimited records (`/events`).
 #[derive(Debug, Default, Clone)]
@@ -57,8 +57,8 @@ pub enum LogStreamKind {
 pub struct LogLine {
     pub stream: LogStreamKind,
     pub text: String,
-    /// When the daemon wrote the line (seconds since the epoch), for `timestamps=1` streams.
-    pub timestamp: Option<f64>,
+    /// When the daemon wrote the line, exact to the nanosecond, for `timestamps=1` streams.
+    pub timestamp: Option<Timestamp>,
 }
 
 impl LogLine {
@@ -78,34 +78,62 @@ pub enum DecoderMode {
     Raw,
 }
 
+/// The unterminated end of one stream: bytes up to `MAX_LINE_BYTES`, and whether more were
+/// dropped.
+#[derive(Debug, Clone, Default)]
+struct PartialLine {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
 /// Decodes Docker's log/attach stream. Containers without a TTY multiplex stdout/stderr with
 /// 8-byte frame headers (`[stream, 0, 0, 0, size(be32)]`); TTY containers send raw bytes.
-/// Incremental, so it serves both buffered and followed logs.
+/// Incremental, so it serves both buffered and followed logs. Memory is bounded whatever the
+/// container writes: frame payloads are decoded as they arrive, and a line longer than
+/// `MAX_LINE_BYTES` keeps its start and is marked with `TRUNCATION_MARK`.
 #[derive(Debug, Clone)]
 pub struct LogStreamDecoder {
     mode: DecoderMode,
     buffer: Vec<u8>,
-    partial: BTreeMap<LogStreamKind, Vec<u8>>,
+    /// The stream and remaining payload bytes of the frame being read (multiplexed mode).
+    frame: Option<(LogStreamKind, usize)>,
+    partial: BTreeMap<LogStreamKind, PartialLine>,
     timestamps: bool,
 }
 
 impl LogStreamDecoder {
+    /// Longest line kept, timestamp included; the rest of a longer line is dropped.
+    pub const MAX_LINE_BYTES: usize = 64 * 1024;
+    /// Appended to lines cut at `MAX_LINE_BYTES`.
+    pub const TRUNCATION_MARK: &'static str = " … [line truncated]";
+
     pub fn new(mode: DecoderMode, timestamps: bool) -> Self {
         LogStreamDecoder {
             mode,
             buffer: Vec::new(),
+            frame: None,
             partial: BTreeMap::new(),
             timestamps,
         }
     }
 
-    fn make_line(&self, bytes: &[u8], stream: LogStreamKind) -> LogLine {
+    fn make_line(&self, line: &PartialLine, stream: LogStreamKind) -> LogLine {
+        let bytes = line.bytes.as_slice();
+        let finish = |text: String| {
+            if line.truncated {
+                text + Self::TRUNCATION_MARK
+            } else {
+                text
+            }
+        };
         if self.timestamps {
             if let Some(space) = bytes.iter().position(|&c| c == b' ').filter(|&s| s >= 20) {
-                if let Some(time) = timestamp::parse(&String::from_utf8_lossy(&bytes[..space])) {
+                if let Some(time) =
+                    timestamp::parse_exact(&String::from_utf8_lossy(&bytes[..space]))
+                {
                     return LogLine {
                         stream,
-                        text: clean(&bytes[space + 1..]),
+                        text: finish(clean(&bytes[space + 1..])),
                         timestamp: Some(time),
                     };
                 }
@@ -113,7 +141,7 @@ impl LogStreamDecoder {
         }
         LogLine {
             stream,
-            text: clean(bytes),
+            text: finish(clean(bytes)),
             timestamp: None,
         }
     }
@@ -133,25 +161,34 @@ impl LogStreamDecoder {
                 self.append_text(&data, LogStreamKind::Stdout, &mut lines);
             }
             DecoderMode::Multiplexed => {
-                while self.buffer.len() >= 8 {
-                    let size = u32::from_be_bytes([
-                        self.buffer[4],
-                        self.buffer[5],
-                        self.buffer[6],
-                        self.buffer[7],
-                    ]) as usize;
-                    if self.buffer.len() < 8 + size {
+                let mut offset = 0;
+                loop {
+                    if let Some((stream, remaining)) = self.frame {
+                        let available = remaining.min(self.buffer.len() - offset);
+                        if available == 0 && remaining > 0 {
+                            break;
+                        }
+                        let payload = self.buffer[offset..offset + available].to_vec();
+                        offset += available;
+                        self.append_text(&payload, stream, &mut lines);
+                        self.frame =
+                            (remaining > available).then_some((stream, remaining - available));
+                        continue;
+                    }
+                    let header = &self.buffer[offset..];
+                    if header.len() < 8 {
                         break;
                     }
-                    let stream = match self.buffer[0] {
+                    let size = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+                    let stream = match header[0] {
                         0 => LogStreamKind::Stdin,
                         2 => LogStreamKind::Stderr,
                         _ => LogStreamKind::Stdout,
                     };
-                    let payload: Vec<u8> = self.buffer[8..8 + size].to_vec();
-                    self.buffer.drain(..8 + size);
-                    self.append_text(&payload, stream, &mut lines);
+                    offset += 8;
+                    self.frame = (size > 0).then_some((stream, size as usize));
                 }
+                self.buffer.drain(..offset);
             }
         }
         lines
@@ -168,22 +205,52 @@ impl LogStreamDecoder {
         let partial = std::mem::take(&mut self.partial);
         partial
             .into_iter()
-            .filter(|(_, bytes)| !bytes.is_empty())
-            .map(|(stream, bytes)| self.make_line(&bytes, stream))
+            .filter(|(_, line)| !line.bytes.is_empty())
+            .map(|(stream, line)| self.make_line(&line, stream))
             .collect()
     }
 
     fn append_text(&mut self, bytes: &[u8], stream: LogStreamKind, lines: &mut Vec<LogLine>) {
         let mut pending = self.partial.remove(&stream).unwrap_or_default();
-        for &byte in bytes {
-            if byte == b'\n' {
-                lines.push(self.make_line(&pending, stream));
-                pending.clear();
+        for segment in bytes.split_inclusive(|&b| b == b'\n') {
+            let (text, ends_line) = match segment.split_last() {
+                Some((b'\n', text)) => (text, true),
+                _ => (segment, false),
+            };
+            let room = Self::MAX_LINE_BYTES.saturating_sub(pending.bytes.len());
+            if pending.truncated {
+                // Past the limit: the rest of this line is dropped.
+            } else if text.len() > room {
+                pending.bytes.extend_from_slice(&text[..room]);
+                trim_partial_utf8(&mut pending.bytes);
+                pending.truncated = true;
             } else {
-                pending.push(byte);
+                pending.bytes.extend_from_slice(text);
+            }
+            if ends_line {
+                lines.push(self.make_line(&pending, stream));
+                pending = PartialLine::default();
             }
         }
-        self.partial.insert(stream, pending);
+        if !pending.bytes.is_empty() {
+            self.partial.insert(stream, pending);
+        }
+    }
+}
+
+/// Drops an incomplete UTF-8 sequence left at the end by a cut.
+fn trim_partial_utf8(bytes: &mut Vec<u8>) {
+    let tail = bytes.len().saturating_sub(4);
+    if let Some(lead) = (tail..bytes.len()).rev().find(|&i| bytes[i] & 0xC0 != 0x80) {
+        let expected = match bytes[lead] {
+            b if b >= 0xF0 => 4,
+            b if b >= 0xE0 => 3,
+            b if b >= 0xC0 => 2,
+            _ => 1,
+        };
+        if lead + expected > bytes.len() {
+            bytes.truncate(lead);
+        }
     }
 }
 
@@ -295,6 +362,71 @@ mod tests {
         let lines = d.feed(b"2024-05-01T12:34:56.5Z hi there\n");
         assert_eq!(lines[0].text, "hi there");
         assert!(lines[0].timestamp.is_some());
+    }
+
+    #[test]
+    fn long_lines_are_cut_and_memory_stays_bounded() {
+        let max = LogStreamDecoder::MAX_LINE_BYTES;
+        for mode in [DecoderMode::Raw, DecoderMode::Multiplexed] {
+            let mut d = LogStreamDecoder::new(mode, false);
+            let chunk = vec![b'x'; 4096];
+            let mut lines = Vec::new();
+            // 1 MiB without a newline, in pieces.
+            for _ in 0..256 {
+                let bytes = if mode == DecoderMode::Raw {
+                    chunk.clone()
+                } else {
+                    frame(1, std::str::from_utf8(&chunk).unwrap())
+                };
+                lines.extend(d.feed(&bytes));
+                let held: usize = d.partial.values().map(|p| p.bytes.len()).sum();
+                assert!(held <= max && d.buffer.len() <= 8 + 4096);
+            }
+            assert!(lines.is_empty());
+            let tail = if mode == DecoderMode::Raw {
+                b"end\nnext\n".to_vec()
+            } else {
+                frame(1, "end\nnext\n")
+            };
+            lines.extend(d.feed(&tail));
+            assert_eq!(lines.len(), 2, "{mode:?}");
+            assert!(lines[0].text.ends_with(LogStreamDecoder::TRUNCATION_MARK));
+            assert_eq!(
+                lines[0].text.len(),
+                max + LogStreamDecoder::TRUNCATION_MARK.len()
+            );
+            assert_eq!(lines[1].text, "next");
+        }
+    }
+
+    #[test]
+    fn large_frames_are_decoded_as_they_arrive() {
+        // A header announcing 1 GiB must not make the decoder wait for (or buffer) all of it.
+        let mut d = LogStreamDecoder::new(DecoderMode::Multiplexed, false);
+        let mut data = vec![2, 0, 0, 0];
+        data.extend_from_slice(&(1u32 << 30).to_be_bytes());
+        data.extend_from_slice(b"first\nsec");
+        let lines = d.feed(&data);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].stream, LogStreamKind::Stderr);
+        assert!(d.buffer.is_empty());
+        let lines = d.feed(b"ond\n");
+        assert_eq!(lines[0].text, "second");
+        assert_eq!(lines[0].stream, LogStreamKind::Stderr);
+    }
+
+    #[test]
+    fn cuts_never_split_a_character() {
+        let max = LogStreamDecoder::MAX_LINE_BYTES;
+        let mut text = "a".repeat(max - 1).into_bytes();
+        text.extend_from_slice("é\n".as_bytes());
+        let mut d = LogStreamDecoder::new(DecoderMode::Raw, false);
+        let lines = d.feed(&text);
+        assert!(!lines[0].text.contains('\u{FFFD}'));
+        assert_eq!(
+            lines[0].text,
+            "a".repeat(max - 1) + LogStreamDecoder::TRUNCATION_MARK
+        );
     }
 
     #[test]
