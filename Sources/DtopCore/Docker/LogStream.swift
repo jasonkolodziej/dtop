@@ -7,10 +7,13 @@ public enum LogStreamKind: UInt8, Sendable, Equatable {
 public struct LogLine: Sendable, Equatable {
     public var stream: LogStreamKind
     public var text: String
+    /// When the daemon wrote the line (seconds since the epoch), for `timestamps=1` streams.
+    public var timestamp: Double?
 
-    public init(stream: LogStreamKind, text: String) {
+    public init(stream: LogStreamKind, text: String, timestamp: Double? = nil) {
         self.stream = stream
         self.text = text
+        self.timestamp = timestamp
     }
 }
 
@@ -27,9 +30,21 @@ public struct LogStreamDecoder: Sendable {
     private var mode: Mode
     private var buffer: [UInt8] = []
     private var partialLines: [LogStreamKind: [UInt8]] = [:]
+    /// The stream was requested with `timestamps=1`: each line starts with an RFC 3339 time.
+    private let timestamps: Bool
 
-    public init(mode: Mode = .automatic) {
+    public init(mode: Mode = .automatic, timestamps: Bool = false) {
         self.mode = mode
+        self.timestamps = timestamps
+    }
+
+    /// Builds a line, splitting off the `timestamps=1` prefix when there is one.
+    private func makeLine(_ bytes: [UInt8], stream: LogStreamKind) -> LogLine {
+        if timestamps, let space = bytes.firstIndex(of: 32), space >= 20,
+           let time = DockerTimestamp.parse(String(decoding: bytes[..<space], as: UTF8.self)) {
+            return LogLine(stream: stream, text: Self.clean(Array(bytes[(space + 1)...])), timestamp: time)
+        }
+        return LogLine(stream: stream, text: Self.clean(bytes))
     }
 
     public mutating func feed(_ bytes: [UInt8]) -> [LogLine] {
@@ -64,7 +79,7 @@ public struct LogStreamDecoder: Sendable {
         var lines: [LogLine] = []
         for stream in [LogStreamKind.stdin, .stdout, .stderr] {
             if let partial = partialLines[stream], !partial.isEmpty {
-                lines.append(LogLine(stream: stream, text: Self.clean(partial)))
+                lines.append(makeLine(partial, stream: stream))
             }
         }
         partialLines.removeAll()
@@ -86,7 +101,7 @@ public struct LogStreamDecoder: Sendable {
         var pending = partialLines[stream] ?? []
         for byte in bytes {
             if byte == 10 {
-                lines.append(LogLine(stream: stream, text: Self.clean(pending)))
+                lines.append(makeLine(pending, stream: stream))
                 pending.removeAll(keepingCapacity: true)
             } else {
                 pending.append(byte)

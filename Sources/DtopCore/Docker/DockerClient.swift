@@ -194,6 +194,71 @@ public struct DockerClient: DockerAPI {
         return decoder.feed(response.body) + decoder.finish()
     }
 
+    public func followLogs(id: String, tail: Int, since: Double?) -> AsyncThrowingStream<[LogLine], Error> {
+        var query: [(String, String?)] = [("follow", "1"), ("stdout", "1"), ("stderr", "1"), ("timestamps", "1")]
+        if let since {
+            // Resuming: everything from that instant on (inclusive; callers drop what they have).
+            query += [("since", Self.unixTimestamp(since)), ("tail", "all")]
+        } else {
+            query.append(("tail", String(max(0, tail))))
+        }
+        let request = makeRequest(.get, "/containers/\(Self.pathSegment(id))/logs", query: query)
+        let http = streamingHTTP
+        return AsyncThrowingStream { continuation in
+            let cancellation = StreamCancellation()
+            continuation.onTermination = { _ in cancellation.cancel() }
+            DispatchQueue.global(qos: .utility).async {
+                var decoder = LogStreamDecoder(timestamps: true)
+                var failure: (status: Int, reason: String)?
+                var errorBody: [UInt8] = []
+                do {
+                    try http.stream(
+                        request,
+                        onConnect: { cancellation.attach($0) },
+                        onHead: { head in
+                            if !head.isSuccess { failure = (head.status, head.reason) }
+                        },
+                        onBody: { chunk in
+                            if failure != nil {
+                                errorBody += chunk
+                                return errorBody.count < 64 * 1024
+                            }
+                            let lines = decoder.feed(chunk)
+                            if !lines.isEmpty { continuation.yield(lines) }
+                            return !cancellation.isCancelled
+                        }
+                    )
+                    if let failure {
+                        let head = HTTPResponseHead(status: failure.status, reason: failure.reason, headers: HTTPHeaders())
+                        continuation.finish(throwing: Self.error(from: HTTPResponse(head: head, body: errorBody)))
+                    } else {
+                        let rest = decoder.finish()
+                        if !rest.isEmpty { continuation.yield(rest) }
+                        continuation.finish()
+                    }
+                } catch {
+                    if cancellation.isCancelled {
+                        continuation.finish()
+                    } else {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Docker's `seconds.nanoseconds` form for `since`/`until`.
+    static func unixTimestamp(_ time: Double) -> String {
+        var seconds = Int64(time.rounded(.down))
+        var nanoseconds = Int(((time - Double(seconds)) * 1_000_000_000).rounded())
+        if nanoseconds >= 1_000_000_000 {
+            seconds += 1
+            nanoseconds -= 1_000_000_000
+        }
+        let digits = String(nanoseconds)
+        return String(seconds) + "." + String(repeating: "0", count: max(0, 9 - digits.count)) + digits
+    }
+
     public func perform(_ action: ContainerAction, containerID: String) async throws {
         let request = makeRequest(.post, "/containers/\(Self.pathSegment(containerID))/\(action.verb)", query: action.query)
         // 304 means "already in that state", which is fine for an interactive tool.

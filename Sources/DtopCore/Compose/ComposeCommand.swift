@@ -77,10 +77,13 @@ public enum ComposeCommandBuilder {
         for operation: ComposeOperation,
         project: ComposeProject,
         dockerExecutable: String = "docker",
-        endpoint: DockerEndpoint? = nil
+        endpoint: DockerEndpoint? = nil,
+        host: DockerHost? = nil
     ) -> CommandInvocation {
         var arguments: [String] = []
-        if let endpoint {
+        if let host {
+            arguments += host.dockerCLIArguments
+        } else if let endpoint {
             arguments += ["--host", endpoint.description]
         }
         arguments += ["compose", "--project-name", project.name]

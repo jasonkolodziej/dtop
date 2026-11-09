@@ -10,6 +10,13 @@ public enum AppCommand: Sendable, Equatable {
     /// Open the theme menu; the runtime supplies the current and available themes.
     case openThemeEditor
     case saveTheme(name: String, theme: Theme)
+    /// Show another host (index into `AppState.hostNames`).
+    case switchHost(Int)
+}
+
+public struct HostHit: Sendable, Equatable {
+    public var index: Int
+    public var rect: Rect
 }
 
 public struct TabHit: Sendable, Equatable {
@@ -39,6 +46,9 @@ public struct HitMap: Sendable, Equatable {
     public var editorRows: [RowHit] = []
     public var confirmButton: Rect?
     public var cancelButton: Rect?
+    /// Host chips in the header and rows of the host list.
+    public var hostChips: [HostHit] = []
+    public var hostRows: [HostHit] = []
 
     public init() {}
 }
@@ -58,6 +68,8 @@ extension AppState {
             return []
         case .filter:
             return handleFilter(event)
+        case .hostPicker(let selected):
+            return handleHostPicker(event, selected: selected, hitMap: hitMap, now: now)
         case .confirm(let confirmation):
             return handleConfirm(event, confirmation: confirmation, hitMap: hitMap)
         case .themeEditor(var editor):
@@ -161,7 +173,20 @@ extension AppState {
         case "v":
             detailPane = detailPane.next()
             detailScroll = 0
+            logFollow = true
             showDetails = true
+        case "f":
+            guard detailPane == .logs, showDetails else {
+                post("f follows the log stream — open the Logs pane with v", level: .info, now: now, duration: 3)
+                break
+            }
+            if logFollow {
+                logFollow = false
+                post("Log view paused — f to follow again", level: .info, now: now, duration: 2)
+            } else {
+                logFollow = true
+                detailScroll = 0
+            }
         case "c":
             if case .composeProject(let project, _)? = selected(items) { toggleCollapsed(project.name) }
         case "t":
@@ -174,12 +199,75 @@ extension AppState {
             return [.openThemeEditor]
         case " ":
             isPaused.toggle()
+            // Resuming while following the log stream jumps back to the newest line.
+            if !isPaused && logFollow && detailPane == .logs { detailScroll = 0 }
             post(isPaused ? "Updates paused — press space to resume" : "Updates resumed", level: .info, now: now,
                  duration: isPaused ? nil : 2)
         case "R":
             return [.refresh(inventory: true)]
+        case "]", "[":
+            guard hasSeveralHosts else {
+                post(Self.singleHostHint, level: .info, now: now, duration: 4)
+                break
+            }
+            let step = character == "]" ? 1 : hostNames.count - 1
+            let target = (activeHost + step) % hostNames.count
+            switchHost(to: target)
+            post("Host: \(hostNames[target])", level: .info, now: now, duration: 2)
+            return [.switchHost(target)]
+        case "H":
+            guard hasSeveralHosts else {
+                post(Self.singleHostHint, level: .info, now: now, duration: 4)
+                break
+            }
+            mode = .hostPicker(selected: activeHost)
         case "u", "x", "r", "p", "K", "D", "U", "X":
             return requestOperation(for: character, item: selected(items), now: now)
+        default:
+            break
+        }
+        return []
+    }
+
+    static let singleHostHint = "Only one Docker host — add more with --host, --context or --all-contexts"
+
+    // MARK: - Host list
+
+    private mutating func handleHostPicker(_ event: InputEvent, selected: Int, hitMap: HitMap, now: Double) -> [AppCommand] {
+        let count = hostNames.count
+        guard count > 0 else {
+            mode = .normal
+            return []
+        }
+        func choose(_ index: Int) -> [AppCommand] {
+            mode = .normal
+            guard index != activeHost else { return [] }
+            switchHost(to: index)
+            post("Host: \(hostNames[index])", level: .info, now: now, duration: 2)
+            return [.switchHost(index)]
+        }
+        switch event {
+        case .key(let key):
+            switch key.key {
+            case .up, .character("k"): mode = .hostPicker(selected: (selected + count - 1) % count)
+            case .down, .character("j"), .tab: mode = .hostPicker(selected: (selected + 1) % count)
+            case .home: mode = .hostPicker(selected: 0)
+            case .end: mode = .hostPicker(selected: count - 1)
+            case .enter, .character(" "): return choose(selected)
+            case .escape, .character("q"), .character("H"): mode = .normal
+            case .character(let character):
+                if let digit = character.wholeNumberValue, (1...count).contains(digit) { return choose(digit - 1) }
+            default: break
+            }
+        case .mouse(let mouse) where mouse.action == .press:
+            if mouse.isWheel {
+                let delta = mouse.button == .wheelUp ? count - 1 : 1
+                mode = .hostPicker(selected: (selected + delta) % count)
+            } else if let hit = hitMap.hostRows.first(where: { $0.rect.contains(x: mouse.x, y: mouse.y) }) {
+                return choose(hit.index)
+            } else {
+                mode = .normal
+            }
         default:
             break
         }
@@ -281,15 +369,22 @@ extension AppState {
                 // wheel moves the other way there (wheel up = older lines).
                 let showsLogs = detailPane == .logs && selected(items)?.container != nil
                 detailScroll = max(0, detailScroll + (showsLogs ? -delta : delta) * 3)
+                // Scrolling back pauses following; scrolling all the way down resumes it.
+                if showsLogs { logFollow = detailScroll == 0 }
             } else {
                 moveSelection(by: delta, items: items)
             }
         case .left where mouse.action == .press:
-            if let hit = hitMap.tabs.first(where: { $0.rect.contains(x: mouse.x, y: mouse.y) }) {
+            if let hit = hitMap.hostChips.first(where: { $0.rect.contains(x: mouse.x, y: mouse.y) }) {
+                guard hit.index != activeHost else { return [] }
+                switchHost(to: hit.index)
+                return [.switchHost(hit.index)]
+            } else if let hit = hitMap.tabs.first(where: { $0.rect.contains(x: mouse.x, y: mouse.y) }) {
                 switchTab(hit.tab)
             } else if let hit = hitMap.detailPanes.first(where: { $0.rect.contains(x: mouse.x, y: mouse.y) }) {
                 detailPane = hit.pane
                 detailScroll = 0
+                logFollow = true
             } else if let hit = hitMap.rows.first(where: { $0.rect.contains(x: mouse.x, y: mouse.y) }), hit.index < items.count {
                 let alreadySelected = ListModel.selectedIndex(in: items, state: self, tab: tab) == hit.index
                 moveSelection(to: hit.index, items: items)

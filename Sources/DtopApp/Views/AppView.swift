@@ -9,14 +9,18 @@ public struct RenderContext: Sendable {
     /// Pre-formatted wall clock (formatting needs the local time zone, which views avoid).
     public var clock: String
     public var now: Double
+    /// Every monitored host, in `state.hostNames` order (empty or one entry for a single host).
+    public var hosts: [HostSummary]
 
-    public init(state: AppState, snapshot: DockerSnapshot, theme: Theme, size: TerminalSize, clock: String = "", now: Double = 0) {
+    public init(state: AppState, snapshot: DockerSnapshot, theme: Theme, size: TerminalSize, clock: String = "", now: Double = 0,
+                hosts: [HostSummary] = []) {
         self.state = state
         self.snapshot = snapshot
         self.theme = theme
         self.size = size
         self.clock = clock
         self.now = now
+        self.hosts = hosts
     }
 }
 
@@ -69,7 +73,7 @@ public enum AppView {
         // While the theme menu is open, everything renders with its draft so edits show live.
         guard case .themeEditor(let editor) = context.state.mode else { return renderBody(context) }
         return renderBody(RenderContext(state: context.state, snapshot: context.snapshot, theme: editor.draft,
-                                        size: context.size, clock: context.clock, now: context.now))
+                                        size: context.size, clock: context.clock, now: context.now, hosts: context.hosts))
     }
 
     // Kept separate from `render` so debug builds don't reserve stack for several copies of the
@@ -94,7 +98,7 @@ public enum AppView {
         let items = ListModel.items(for: context.state.tab, snapshot: context.snapshot, state: context.state)
         let selectedIndex = ListModel.selectedIndex(in: items, state: context.state, tab: context.state.tab)
 
-        HeaderView.draw(into: &buffer, rect: layout.header, context: context)
+        hitMap.hostChips = HeaderView.draw(into: &buffer, rect: layout.header, context: context)
         if let metrics = layout.metrics {
             MetricsView.draw(into: &buffer, rect: metrics, context: context)
         }
@@ -121,6 +125,8 @@ public enum AppView {
             hitMap.cancelButton = buttons.cancel
         case .themeEditor(let editor):
             hitMap.editorRows = ThemeEditorView.draw(into: &buffer, editor: editor)
+        case .hostPicker(let selected):
+            hitMap.hostRows = OverlayView.drawHostPicker(into: &buffer, selected: selected, context: context)
         default:
             break
         }

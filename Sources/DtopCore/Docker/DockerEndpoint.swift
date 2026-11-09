@@ -5,6 +5,8 @@ public enum DockerEndpoint: Equatable, Sendable, CustomStringConvertible {
     case tcp(host: String, port: Int)
 
     public static let defaultTCPPort = 2375
+    /// Docker's conventional port for TLS (`--tlsverify`) daemons.
+    public static let defaultTLSPort = 2376
     public static let defaultWindowsPipe = #"\\.\pipe\docker_engine"#
     public static let defaultUnixSocket = "/var/run/docker.sock"
 
@@ -32,8 +34,29 @@ public enum DockerEndpoint: Equatable, Sendable, CustomStringConvertible {
         }
     }
 
-    /// Parses `DOCKER_HOST`-style strings.
-    public static func parse(_ raw: String) throws -> DockerEndpoint {
+    /// Whether the daemon runs on this machine (sockets, pipes, loopback TCP), so that things
+    /// measured here — like GPU usage — belong to it.
+    public var isLocal: Bool {
+        switch self {
+        case .unixSocket, .namedPipe: return true
+        case .tcp(let host, _): return ["localhost", "127.0.0.1", "::1"].contains(host.lowercased())
+        }
+    }
+
+    /// The host name or address of a TCP endpoint (nil for local transports).
+    public var tcpHost: String? {
+        if case .tcp(let host, _) = self { return host }
+        return nil
+    }
+
+    /// Whether `raw` names an endpoint that is TLS by its scheme (`https://`).
+    public static func schemeImpliesTLS(_ raw: String) -> Bool {
+        raw.trimmingWhitespace().lowercased().hasPrefix("https://")
+    }
+
+    /// Parses `DOCKER_HOST`-style strings. A TCP address without a port gets 2376 when `tls` is
+    /// true (or the scheme is `https://`) and 2375 otherwise, as the Docker CLI does.
+    public static func parse(_ raw: String, tls: Bool = false) throws -> DockerEndpoint {
         let value = raw.trimmingWhitespace()
         guard !value.isEmpty else { throw DockerError.invalidEndpoint(raw) }
 
@@ -48,9 +71,12 @@ public enum DockerEndpoint: Equatable, Sendable, CustomStringConvertible {
             return .namedPipe(path: normalized)
         }
         if let rest = value.dropPrefix("tcp://") ?? value.dropPrefix("http://") {
-            return try parseHostPort(rest, original: raw)
+            return try parseHostPort(rest, original: raw, defaultPort: tls ? defaultTLSPort : defaultTCPPort)
         }
-        if value.hasPrefix("ssh://") || value.hasPrefix("https://") {
+        if let rest = value.dropPrefix("https://") {
+            return try parseHostPort(rest, original: raw, defaultPort: defaultTLSPort)
+        }
+        if value.hasPrefix("ssh://") {
             throw DockerError.unsupportedEndpoint(raw)
         }
         if value.contains("://") {
@@ -66,7 +92,7 @@ public enum DockerEndpoint: Equatable, Sendable, CustomStringConvertible {
         throw DockerError.invalidEndpoint(raw)
     }
 
-    private static func parseHostPort(_ rest: String, original: String) throws -> DockerEndpoint {
+    private static func parseHostPort(_ rest: String, original: String, defaultPort: Int) throws -> DockerEndpoint {
         var authority = rest
         if let slash = authority.firstIndex(of: "/") {
             let path = authority[slash...]
@@ -93,7 +119,7 @@ public enum DockerEndpoint: Equatable, Sendable, CustomStringConvertible {
         }
         if host.isEmpty { host = "127.0.0.1" }
 
-        var port = defaultTCPPort
+        var port = defaultPort
         if let portText {
             guard let parsed = Int(portText), (1...65_535).contains(parsed) else {
                 throw DockerError.invalidEndpoint(original)

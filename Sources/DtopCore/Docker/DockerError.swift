@@ -11,15 +11,18 @@ public enum DockerError: Error, Equatable, Sendable, CustomStringConvertible {
     case decoding(String)
     case cancelled
     case timedOut(String)
+    /// TLS setup or handshake failed. The message says what was wrong and how to fix it.
+    case tls(String)
 
     public var description: String {
         switch self {
         case .invalidEndpoint(let value):
             return "Invalid Docker endpoint '\(value)' — use unix:///path/to/docker.sock, "
-                + "npipe:////./pipe/docker_engine or tcp://host:port (via --host or DOCKER_HOST)"
+                + "npipe:////./pipe/docker_engine, tcp://host:port or https://host:2376 (via --host or DOCKER_HOST)"
         case .unsupportedEndpoint(let value):
-            return "Unsupported Docker endpoint '\(value)' — dtop speaks plain HTTP over unix sockets, "
-                + "named pipes and tcp; for ssh:// or TLS endpoints, forward the socket locally first"
+            return "Unsupported Docker endpoint '\(value)' — dtop connects over unix sockets, named pipes and "
+                + "tcp (with or without TLS); for ssh:// hosts, forward the socket first "
+                + "(ssh -NL /tmp/docker.sock:/var/run/docker.sock host) and use unix:///tmp/docker.sock"
         case .connectionFailed(let endpoint, let reason):
             return "Cannot connect to Docker at \(endpoint) (\(reason)) — is the Docker daemon running? "
                 + "Set DOCKER_HOST or pass --host to point dtop at another endpoint"
@@ -31,6 +34,10 @@ public enum DockerError: Error, Equatable, Sendable, CustomStringConvertible {
         case .malformedResponse(let reason):
             return "Docker returned a response dtop could not parse: \(reason)"
         case .http(let status, let message):
+            if message.contains("HTTP request to an HTTPS server") {
+                return "Docker API error \(status): \(message) — this daemon expects TLS: add --tlsverify "
+                    + "(with --tlscacert/--tlscert/--tlskey or DOCKER_CERT_PATH), or use https://"
+            }
             return "Docker API error \(status): \(message)"
         case .decoding(let reason):
             return "Could not decode Docker API response: \(reason) — your Docker version may be unsupported"
@@ -38,6 +45,8 @@ public enum DockerError: Error, Equatable, Sendable, CustomStringConvertible {
             return "Request was cancelled"
         case .timedOut(let operation):
             return "Timed out waiting for Docker during \(operation) — the daemon may be overloaded"
+        case .tls(let reason):
+            return "TLS error: \(reason)"
         }
     }
 

@@ -118,6 +118,8 @@ public enum InputMode: Sendable, Equatable {
     case filter
     case help
     case confirm(Confirmation)
+    /// The host list (`H`), with the highlighted row.
+    case hostPicker(selected: Int)
     // Boxed: the editor carries several full themes, and keeping it inline made every AppState
     // copy ~600 bytes, which overflowed 512 KB secondary-thread stacks on macOS in debug builds.
     indirect case themeEditor(ThemeEditor)
@@ -138,14 +140,33 @@ public struct AppState: Sendable, Equatable {
     public var showDetails = true
     public var detailPane: DetailPane = .overview
     public var detailScroll = 0
+    /// The logs pane sticks to the newest line until the user scrolls back (or presses `f`).
+    public var logFollow = true
     public var collapsedProjects: Set<String> = []
     public var mode: InputMode = .normal
     public var notice: Notice?
     public var themeName: String = "harbor"
     public var isPaused = false
     public var shouldQuit = false
+    /// Names of the monitored hosts, in order, and which one the views show.
+    public var hostNames: [String] = []
+    public var activeHost = 0
 
     public init() {}
+
+    public var hasSeveralHosts: Bool { hostNames.count > 1 }
+
+    /// Makes `index` the active host. Selections and scroll positions belong to the previous
+    /// host's lists, so they reset; filter, sort and tab carry over.
+    public mutating func switchHost(to index: Int) {
+        guard hostNames.indices.contains(index), index != activeHost else { return }
+        activeHost = index
+        selectedIDs.removeAll()
+        selectedIndexes.removeAll()
+        scrollOffsets.removeAll()
+        detailScroll = 0
+        logFollow = true
+    }
 
     public init(configuration: AppConfiguration) {
         sortKey = configuration.sortKey

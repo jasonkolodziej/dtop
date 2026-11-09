@@ -55,13 +55,24 @@ jobs:
       - name: Build
         run: swift build
 
+      # The TLS tests mint certificates and run `openssl s_server`; every runner image has the
+      # openssl tool (Git for Windows ships one), and DTOP_REQUIRE_TLS_TESTS turns a missing tool
+      # into a failure instead of a skip.
+      - name: Show openssl
+        shell: bash
+        run: command -v openssl && openssl version
+
       - name: Test
+        env:
+          DTOP_REQUIRE_TLS_TESTS: "1"
         run: swift test
 
       # macOS gives secondary threads 512 KB stacks while Linux defaults to 8 MB, so a debug
       # build with an oversized stack frame only crashes on macOS. Catch that on Linux too.
       - name: Test with macOS-sized thread stacks (512 KB)
         if: runner.os == 'Linux'
+        env:
+          DTOP_REQUIRE_TLS_TESTS: "1"
         run: bash -c 'ulimit -s 512 && .build/debug/dtopPackageTests.xctest --testing-library swift-testing'
 
       # GitHub's Linux runners have a Docker daemon, so exercise the real Engine API there.
@@ -81,6 +92,38 @@ jobs:
       - name: Smoke test --once against Docker (Linux)
         if: runner.os == 'Linux'
         run: swift run dtop --once
+
+      # A real TLS daemon: docker:dind generates a CA, server and client certificates in
+      # /certs and listens on 2376 with --tlsverify. dtop connects the way the Docker CLI would.
+      - name: Smoke test --once against a TLS Docker daemon (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/dind-certs"
+          docker run -d --name dtop-dind --privileged -p 127.0.0.1:2376:2376 \
+            -e DOCKER_TLS_CERTDIR=/certs -v "$RUNNER_TEMP/dind-certs:/certs" docker:27-dind
+          for i in $(seq 1 60); do
+            [ -f "$RUNNER_TEMP/dind-certs/client/key.pem" ] && \
+              docker --host tcp://127.0.0.1:2376 --tlsverify --tlscacert "$RUNNER_TEMP/dind-certs/client/ca.pem" \
+                --tlscert "$RUNNER_TEMP/dind-certs/client/cert.pem" --tlskey "$RUNNER_TEMP/dind-certs/client/key.pem" \
+                version > /dev/null 2>&1 && break
+            sleep 2
+          done
+          sudo chmod -R a+r "$RUNNER_TEMP/dind-certs"
+          docker --host tcp://127.0.0.1:2376 --tlsverify --tlscacert "$RUNNER_TEMP/dind-certs/client/ca.pem" \
+            --tlscert "$RUNNER_TEMP/dind-certs/client/cert.pem" --tlskey "$RUNNER_TEMP/dind-certs/client/key.pem" \
+            run -d --name tls-probe alpine:3.20 sleep 600
+          DOCKER_HOST=tcp://localhost:2376 DOCKER_TLS_VERIFY=1 DOCKER_CERT_PATH="$RUNNER_TEMP/dind-certs/client" \
+            swift run dtop --once | tee "$RUNNER_TEMP/tls-once.txt"
+          grep -q tls-probe "$RUNNER_TEMP/tls-once.txt"
+          # Both daemons at once: the runner's local socket and the TLS daemon.
+          swift run dtop --once --host local=unix:///var/run/docker.sock \
+            --host dind=tcp://localhost:2376 --tlsverify --tlscacert "$RUNNER_TEMP/dind-certs/client/ca.pem" \
+            --tlscert "$RUNNER_TEMP/dind-certs/client/cert.pem" --tlskey "$RUNNER_TEMP/dind-certs/client/key.pem" \
+            | tee "$RUNNER_TEMP/multi-once.txt"
+          grep -q "== local ==" "$RUNNER_TEMP/multi-once.txt"
+          grep -q "== dind ==" "$RUNNER_TEMP/multi-once.txt"
+          grep -q tls-probe "$RUNNER_TEMP/multi-once.txt"
 
   lint-and-validate:
     name: Lint & Validate

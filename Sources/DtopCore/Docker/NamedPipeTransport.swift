@@ -34,7 +34,7 @@ final class NamedPipeConnection: DockerConnection, @unchecked Sendable {
         while offset < bytes.count {
             var written: DWORD = 0
             let ok = bytes.withUnsafeBytes { raw in
-                WriteFile(pipe, raw.baseAddress! + offset, DWORD(bytes.count - offset), &written, nil)
+                WriteFile(pipe, raw.baseAddress!.advanced(by: offset), DWORD(bytes.count - offset), &written, nil)
             }
             guard win32Succeeded(ok) else {
                 throw DockerError.io("WriteFile failed with Windows error \(GetLastError())")

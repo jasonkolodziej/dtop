@@ -2,7 +2,9 @@ import DtopCore
 import DtopUI
 
 enum HeaderView {
-    static func draw(into buffer: inout ScreenBuffer, rect: Rect, context: RenderContext) {
+    /// Draws the header; with several hosts it includes one clickable chip per host.
+    @discardableResult
+    static func draw(into buffer: inout ScreenBuffer, rect: Rect, context: RenderContext) -> [HostHit] {
         let theme = context.theme
         let base = Style(foreground: theme[.headerForeground], background: theme[.headerBackground])
         buffer.fill(rect, style: base)
@@ -11,6 +13,28 @@ enum HeaderView {
         var x = rect.x + 1
         x += BrandMark.drawCompact(into: &buffer, x: x, y: rect.y, base: base, theme: theme, maxWidth: rect.maxX - x)
         x += buffer.write(" dtop ", x: x, y: rect.y, style: base.foreground(theme[.title]).bold, maxWidth: max(0, rect.maxX - x))
+        var hits: [HostHit] = []
+        if context.hosts.count > 1 {
+            // Leave room for the connection summary on the right.
+            let limit = rect.maxX - min(30, rect.width / 3)
+            for (index, host) in context.hosts.enumerated() {
+                let active = index == context.state.activeHost
+                let label = " \(Self.connectionSymbol(host.connection)) \(host.name) "
+                let width = TextWidth.of(label)
+                guard x + width <= limit else {
+                    x += buffer.write("…", x: x, y: rect.y, style: base.foreground(theme[.muted]), maxWidth: max(0, limit - x))
+                    break
+                }
+                var chipStyle = active
+                    ? Style(foreground: theme[.background] == .default ? theme[.selectionForeground] : theme[.background],
+                            background: theme[.tabActive], attributes: .bold)
+                    : base.foreground(theme[Self.connectionRole(host.connection)])
+                if active && theme.usesAttributesForEmphasis { chipStyle = chipStyle.adding(.reverse) }
+                buffer.write(label, x: x, y: rect.y, style: chipStyle)
+                hits.append(HostHit(index: index, rect: Rect(x: x, y: rect.y, width: width, height: 1)))
+                x += width + 1
+            }
+        }
         var facts: [String] = []
         if let version = snapshot.version {
             facts.append("docker \(version.version)")
@@ -53,6 +77,23 @@ enum HeaderView {
         for (index, part) in right.enumerated() {
             if index > 0 { rightX += buffer.write("  ", x: rightX, y: rect.y, style: base) }
             rightX += buffer.write(part.0, x: rightX, y: rect.y, style: part.1, maxWidth: rect.maxX - rightX)
+        }
+        return hits
+    }
+
+    static func connectionSymbol(_ connection: ConnectionState) -> String {
+        switch connection {
+        case .connected: return "●"
+        case .connecting: return "○"
+        case .disconnected: return "✕"
+        }
+    }
+
+    static func connectionRole(_ connection: ConnectionState) -> ThemeRole {
+        switch connection {
+        case .connected: return .statusRunning
+        case .connecting: return .warning
+        case .disconnected: return .error
         }
     }
 }
@@ -211,7 +252,8 @@ enum TabBarView {
 
 enum FooterView {
     static func hints(for context: RenderContext) -> [(String, String)] {
-        let common: [(String, String)] = [("q", "quit"), ("?", "help"), ("/", "filter")]
+        var common: [(String, String)] = [("q", "quit"), ("?", "help"), ("/", "filter")]
+        if context.state.hasSeveralHosts { common.append(("H", "hosts")) }
         switch context.state.tab {
         case .containers:
             return common + [("s", "sort"), ("a", "show"), ("u", "start"), ("x", "stop"), ("r", "restart"),

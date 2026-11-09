@@ -67,13 +67,29 @@ dependencies.
 - ⏳ Profiling on hosts with hundreds of containers (stats fan-out is capped at 8 concurrent
   requests)
 
+### Phase 6: Remote and multi-host ✅
+- ✅ TLS for `tcp://`/`https://` the Docker CLI way (`--tlsverify`, `DOCKER_TLS_VERIFY`,
+  `DOCKER_CERT_PATH`, client certificates) on each platform's own stack — OpenSSL (Linux),
+  Network.framework (macOS), SChannel (Windows) — see ADR 0003
+- ✅ TLS 1.3 wherever the OS supports it, 1.2 otherwise. Windows uses `SCH_CREDENTIALS` (1.3 on
+  Windows 11 / Server 2022) and falls back to `SCHANNEL_CRED` (1.2) before Windows 10 1809
+- ✅ Plain `tcp://` on Windows (Winsock)
+- ✅ Docker contexts: the active context, `--context`, `--all-contexts`
+- ✅ Several hosts at once: header chips, `[`/`]`, host list (`H`), `[host NAME]` config sections,
+  `--once` sections
+- ✅ Live log streaming (`logs?follow=1`) with follow/pause and reconnects
+- ✅ Verified with real handshakes against `openssl s_server` on all three OSes (including
+  TLS 1.3-only and 1.2-only servers, with the negotiated version asserted), `--once` against a
+  `--tlsverify` docker:dind daemon in CI, and pseudo-terminal e2e runs (two hosts, logs over TLS)
+- ⏳ The Windows `SCHANNEL_CRED` fallback on a real pre-1809 system (CI forces it on Server 2022)
+
 ## Next Up
 - GPU: AMD and Intel on Windows via performance counters (`\GPU Engine(*)\Utilization Percentage`);
   optionally use AMD SMI / NVML directly (loaded at runtime) for richer metrics
-- Follow logs live (`logs?follow=1`) instead of re-fetching the tail each tick
 - `exec` into a container (hand the TTY to `docker exec -it`)
-- TLS for `tcp://` endpoints (`DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`) and TCP on Windows
-- Docker contexts (`docker context` / `~/.docker/config.json` `currentContext`)
+- `ssh://` endpoints (spawn `ssh … docker system dial-stdio` like the Docker CLI)
+- Keep-alive / TLS session resumption for remote hosts (one handshake per request today)
+- An "all hosts" container view with a HOST column
 - Per-container graphs in the details panel; a disk usage view (`/system/df`)
 - Image pull with progress; persisting UI preferences (sort, collapsed projects)
 

@@ -8,14 +8,39 @@ public enum ConnectionState: Sendable, Equatable {
     public var isConnected: Bool { self == .connected }
 }
 
+/// Where the followed log stream of the selected container stands.
+public enum LogStreamState: Sendable, Equatable {
+    /// Not streaming (logs were fetched once, or nothing was asked for).
+    case idle
+    /// `logs -f` is open and new lines are appended as they arrive.
+    case live
+    /// The stream ended: the container stopped, or the connection broke (with the reason).
+    case ended(String?)
+}
+
 /// Data for the detail panel of one container. Loaded lazily for the selection only.
 public struct ContainerDetailData: Sendable, Equatable {
     public var containerID: String
     public var details: ContainerDetails?
     public var processes: [ProcessTreeRow]
     public var logs: [LogLine]
+    public var logState: LogStreamState = .idle
     public var error: String?
     public var loadedAt: Double
+
+    /// Lines kept for a followed stream; older lines scroll out.
+    public static let maximumLogLines = 5_000
+
+    /// Appends streamed lines, keeping at most `maximumLogLines`. Returns how many lines were
+    /// dropped from the front.
+    @discardableResult
+    public mutating func appendLogs(_ lines: [LogLine]) -> Int {
+        logs += lines
+        let overflow = logs.count - Self.maximumLogLines
+        guard overflow > 0 else { return 0 }
+        logs.removeFirst(overflow)
+        return overflow
+    }
 
     public init(
         containerID: String,
@@ -84,4 +109,30 @@ public struct DockerSnapshot: Sendable {
 
     public var runningCount: Int { containers.filter { $0.state == .running }.count }
     public var stoppedCount: Int { containers.filter { !$0.state.isActive }.count }
+}
+
+/// One line about a host for the header chips and the host list.
+public struct HostSummary: Sendable, Equatable {
+    public var name: String
+    public var description: String
+    public var connection: ConnectionState
+    public var running: Int
+    public var total: Int
+    public var cpuPercent: Double?
+    public var cpuCount: Int
+    public var memoryUsed: UInt64?
+    public var memoryTotal: UInt64
+
+    public init(name: String, description: String, snapshot: DockerSnapshot) {
+        self.name = name
+        self.description = description
+        connection = snapshot.connection
+        running = snapshot.runningCount
+        total = snapshot.containers.count
+        let connected = snapshot.connection.isConnected && snapshot.lastUpdated != nil
+        cpuPercent = connected ? snapshot.metrics.totalLatest.cpuPercent : nil
+        cpuCount = snapshot.info?.cpuCount ?? 0
+        memoryUsed = connected ? snapshot.metrics.totalLatest.memoryUsage : nil
+        memoryTotal = UInt64(clamping: snapshot.info?.memoryTotal ?? 0)
+    }
 }

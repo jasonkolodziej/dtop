@@ -75,6 +75,10 @@ public protocol DockerAPI: Sendable {
     func stats(id: String) async throws -> ContainerStats
     func top(id: String) async throws -> ContainerTop
     func logs(id: String, tail: Int) async throws -> [LogLine]
+    /// The last `tail` lines (or, with `since`, every line from that time on), then every new
+    /// line as the container writes it (`logs -f`). Lines carry their timestamps. Yields batches
+    /// as they arrive; finishes when the container stops or the stream is cancelled.
+    func followLogs(id: String, tail: Int, since: Double?) -> AsyncThrowingStream<[LogLine], Error>
     func perform(_ action: ContainerAction, containerID: String) async throws
     func removeContainer(id: String, force: Bool, removeVolumes: Bool) async throws
     func pruneContainers() async throws -> PruneReport
@@ -92,4 +96,26 @@ public protocol DockerAPI: Sendable {
     func pruneVolumes() async throws -> PruneReport
 
     func events() -> AsyncThrowingStream<DockerEvent, Error>
+}
+
+extension DockerAPI {
+    /// Follows from the last `tail` lines.
+    public func followLogs(id: String, tail: Int) -> AsyncThrowingStream<[LogLine], Error> {
+        followLogs(id: id, tail: tail, since: nil)
+    }
+
+    /// Fallback for implementations without streaming: one fetch, then the stream ends.
+    public func followLogs(id: String, tail: Int, since: Double?) -> AsyncThrowingStream<[LogLine], Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    continuation.yield(try await logs(id: id, tail: tail))
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }

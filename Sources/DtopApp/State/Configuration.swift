@@ -22,7 +22,21 @@ public struct ConfigurationError: Error, Equatable, CustomStringConvertible {
 
 /// Everything that can be set from the config file or the command line.
 public struct AppConfiguration: Sendable, Equatable {
-    public var host: String?
+    /// Docker hosts to monitor (`--host`, `--context`, `host =`, `[host NAME]`). Empty means the
+    /// default host: DOCKER_HOST, the active Docker context, or the local socket.
+    public var hosts: [HostRequest] = []
+    /// TLS flags that apply to every host (`--tls`, `--tlsverify`, `--tlscacert`, …).
+    public var globalTLS = TLSRequest()
+    /// Monitor every Docker context (`--all-contexts`).
+    public var allContexts = false
+    /// Set once the command line names a host, so it replaces (not extends) the file's hosts.
+    private var hostsFromCommandLine = false
+
+    /// The first host's address; kept for single-host callers.
+    public var host: String? {
+        get { hosts.first?.address }
+        set { hosts = newValue.map { [HostRequest.parse($0)] } ?? [] }
+    }
     public var refreshInterval: Double = 2
     public var themeName: String = "harbor"
     public var colorMode: ColorMode?
@@ -43,10 +57,24 @@ public struct AppConfiguration: Sendable, Equatable {
     public static let historyRange: ClosedRange<Int> = 30...3600
 
     /// Applies `key = value` lines from `dtop.conf`. Unknown keys are errors so typos surface.
+    /// `[host NAME]` starts a section whose keys describe one more host (see `applyHostKey`).
     public mutating func apply(configFile text: String) throws {
+        var section: Int?
         for (offset, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
             let line = String(rawLine).trimmingSpaces()
             if line.isEmpty || line.hasPrefix("#") || line.hasPrefix(";") { continue }
+            if line.hasPrefix("[") {
+                guard line.hasSuffix("]") else {
+                    throw ConfigurationError("dtop.conf line \(offset + 1): expected '[host NAME]', found '\(line)'")
+                }
+                let words = line.dropFirst().dropLast().split(separator: " ", omittingEmptySubsequences: true)
+                guard words.count == 2, words[0].lowercased() == "host" else {
+                    throw ConfigurationError("dtop.conf line \(offset + 1): sections must be '[host NAME]', found '\(line)'")
+                }
+                hosts.append(HostRequest(name: String(words[1])))
+                section = hosts.count - 1
+                continue
+            }
             guard let equals = line.firstIndex(of: "=") else {
                 throw ConfigurationError("dtop.conf line \(offset + 1): expected 'key = value', found '\(line)'")
             }
@@ -54,17 +82,72 @@ public struct AppConfiguration: Sendable, Equatable {
             var value = String(line[line.index(after: equals)...]).trimmingSpaces()
             if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") { value = String(value.dropFirst().dropLast()) }
             do {
-                try apply(key: key, value: value)
+                if let section {
+                    try applyHostKey(key, value: value, to: &hosts[section])
+                } else {
+                    try apply(key: key, value: value)
+                }
             } catch let error as ConfigurationError {
                 throw ConfigurationError("dtop.conf line \(offset + 1): \(error.message)")
             }
         }
+        for (index, host) in hosts.enumerated() where host.name != nil {
+            if host.address == nil && host.context == nil {
+                throw ConfigurationError("dtop.conf: [host \(host.name ?? "")] needs 'endpoint = …' or 'context = …' (host \(index + 1))")
+            }
+            if host.address != nil && host.context != nil {
+                throw ConfigurationError("dtop.conf: [host \(host.name ?? "")] sets both 'endpoint' and 'context' — "
+                    + "a context already names its endpoint; keep one of them")
+            }
+        }
+    }
+
+    /// Keys allowed inside a `[host NAME]` section.
+    func applyHostKey(_ key: String, value: String, to host: inout HostRequest) throws {
+        switch key {
+        case "endpoint", "host", "address", "docker_host":
+            host.address = value.isEmpty ? nil : value
+        case "context":
+            host.context = value.isEmpty ? nil : value
+        default:
+            guard try Self.applyTLSKey(key, value: value, to: &host.tls) else {
+                throw ConfigurationError("'\(key)' is not valid in a [host] section — use endpoint, context, tls, "
+                    + "tlsverify, tlscacert, tlscert, tlskey or cert_path")
+            }
+        }
+    }
+
+    /// TLS keys shared by the global settings and `[host]` sections. Returns false for other keys.
+    static func applyTLSKey(_ key: String, value: String, to tls: inout TLSRequest) throws -> Bool {
+        switch key {
+        case "tls": tls.enabled = try parseBool(value, key: key)
+        case "tlsverify", "tls_verify": tls.verify = try parseBool(value, key: key)
+        case "tlscacert", "tls_ca_cert", "tls_ca": tls.caFile = value.isEmpty ? nil : value
+        case "tlscert", "tls_cert": tls.certificateFile = value.isEmpty ? nil : value
+        case "tlskey", "tls_key": tls.keyFile = value.isEmpty ? nil : value
+        case "cert_path", "tls_cert_path", "docker_cert_path": tls.certificateDirectory = value.isEmpty ? nil : value
+        default: return false
+        }
+        return true
     }
 
     mutating func apply(key: String, value: String) throws {
         switch key {
         case "host", "docker_host":
-            host = value.isEmpty ? nil : value
+            // Repeatable: each line adds a host (`name=endpoint` names it). Empty clears the list.
+            if value.isEmpty {
+                hosts.removeAll()
+            } else {
+                hosts.append(HostRequest.parse(value))
+            }
+        case "context":
+            if value.isEmpty {
+                hosts.removeAll { $0.context != nil }
+            } else {
+                hosts.append(HostRequest(context: value))
+            }
+        case "all_contexts":
+            allContexts = try Self.parseBool(value, key: key)
         case "interval", "refresh_interval":
             refreshInterval = try Self.parseInterval(value)
         case "theme":
@@ -98,7 +181,9 @@ public struct AppConfiguration: Sendable, Equatable {
             }
             historySize = size
         default:
-            throw ConfigurationError("unknown setting '\(key)'")
+            guard try Self.applyTLSKey(key, value: value, to: &globalTLS) else {
+                throw ConfigurationError("unknown setting '\(key)'")
+            }
         }
     }
 
@@ -138,8 +223,17 @@ public struct AppConfiguration: Sendable, Equatable {
       dtop [options]
 
     OPTIONS:
-      -H, --host <endpoint>     Docker endpoint (unix:///var/run/docker.sock, npipe:////./pipe/docker_engine,
-                                tcp://host:2375). Defaults to DOCKER_HOST, then well-known sockets.
+      -H, --host [name=]<endpoint>
+                                Docker endpoint (unix:///var/run/docker.sock, npipe:////./pipe/docker_engine,
+                                tcp://host:2375, https://host:2376). Repeat to monitor several hosts.
+                                Defaults to DOCKER_HOST, then the active Docker context, then local sockets.
+          --context <name>      Monitor a Docker context (repeatable; see docker context ls)
+          --all-contexts        Monitor every Docker context
+          --tls                 Use TLS (without verifying the daemon unless --tlsverify)
+          --tlsverify           Use TLS and verify the daemon (also DOCKER_TLS_VERIFY=1)
+          --tlscacert <file>    CA that issued the daemon certificate (default ~/.docker/ca.pem)
+          --tlscert <file>      Client certificate (default ~/.docker/cert.pem)
+          --tlskey <file>       Client key (default ~/.docker/key.pem; DOCKER_CERT_PATH moves all three)
       -i, --interval <seconds>  Refresh interval, 0.25-60 (default 2; accepts 500ms)
       -t, --theme <name|file>   Built-in theme name or path to a .theme file (default harbor)
           --color <mode>        auto, truecolor, 256, 16 or none (default auto; honours NO_COLOR)
@@ -156,7 +250,7 @@ public struct AppConfiguration: Sendable, Equatable {
       -v, --version             Show version
 
     KEYS (press ? inside dtop for the full list):
-      ↑/↓ j/k move · ←/→ Tab switch views · / filter · s sort · Enter details · T themes · q quit
+      ↑/↓ j/k move · ←/→ Tab switch views · / filter · s sort · Enter details · [ ] H hosts · T themes · q quit
     """
 
     /// Pre-scans for `--config` so the file can be applied before other flags override it.
@@ -205,7 +299,23 @@ public struct AppConfiguration: Sendable, Equatable {
             case "--print-theme":
                 mode = .printTheme(try value())
             case "-H", "--host":
-                host = try value()
+                startCommandLineHosts()
+                hosts.append(HostRequest.parse(try value()))
+            case "--context":
+                startCommandLineHosts()
+                hosts.append(HostRequest(context: try value()))
+            case "--all-contexts":
+                allContexts = true
+            case "--tls":
+                globalTLS.enabled = try inlineValue.map { try Self.parseBool($0, key: "--tls") } ?? true
+            case "--tlsverify":
+                globalTLS.verify = try inlineValue.map { try Self.parseBool($0, key: "--tlsverify") } ?? true
+            case "--tlscacert":
+                globalTLS.caFile = try value()
+            case "--tlscert":
+                globalTLS.certificateFile = try value()
+            case "--tlskey":
+                globalTLS.keyFile = try value()
             case "-i", "--interval":
                 refreshInterval = try Self.parseInterval(try value())
             case "-t", "--theme":
@@ -234,6 +344,14 @@ public struct AppConfiguration: Sendable, Equatable {
                 throw ConfigurationError("unknown option '\(arguments[index])' — run dtop --help for usage")
             }
             index += 1
+        }
+    }
+
+    /// The first `--host`/`--context` on the command line replaces the hosts from the file.
+    private mutating func startCommandLineHosts() {
+        if !hostsFromCommandLine {
+            hostsFromCommandLine = true
+            hosts.removeAll()
         }
     }
 
