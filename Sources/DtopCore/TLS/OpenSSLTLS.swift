@@ -341,7 +341,7 @@ final class OpenSSLConnection: DockerConnection, TLSSessionInfo, @unchecked Send
         var offset = 0
         while offset < bytes.count {
             let written = bytes.withUnsafeBytes { raw in
-                library.sslWrite(ssl, raw.baseAddress! + offset, Int32(min(raw.count - offset, 1 << 20)))
+                library.sslWrite(ssl, raw.baseAddress!.advanced(by: offset), Int32(min(raw.count - offset, 1 << 20)))
             }
             try flushOutput()
             if written > 0 {

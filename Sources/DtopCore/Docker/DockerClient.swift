@@ -194,16 +194,21 @@ public struct DockerClient: DockerAPI {
         return decoder.feed(response.body) + decoder.finish()
     }
 
-    public func followLogs(id: String, tail: Int) -> AsyncThrowingStream<[LogLine], Error> {
-        let request = makeRequest(.get, "/containers/\(Self.pathSegment(id))/logs", query: [
-            ("follow", "1"), ("stdout", "1"), ("stderr", "1"), ("tail", String(max(0, tail)))
-        ])
+    public func followLogs(id: String, tail: Int, since: Double?) -> AsyncThrowingStream<[LogLine], Error> {
+        var query: [(String, String?)] = [("follow", "1"), ("stdout", "1"), ("stderr", "1"), ("timestamps", "1")]
+        if let since {
+            // Resuming: everything from that instant on (inclusive; callers drop what they have).
+            query += [("since", Self.unixTimestamp(since)), ("tail", "all")]
+        } else {
+            query.append(("tail", String(max(0, tail))))
+        }
+        let request = makeRequest(.get, "/containers/\(Self.pathSegment(id))/logs", query: query)
         let http = streamingHTTP
         return AsyncThrowingStream { continuation in
             let cancellation = StreamCancellation()
             continuation.onTermination = { _ in cancellation.cancel() }
             DispatchQueue.global(qos: .utility).async {
-                var decoder = LogStreamDecoder()
+                var decoder = LogStreamDecoder(timestamps: true)
                 var failure: (status: Int, reason: String)?
                 var errorBody: [UInt8] = []
                 do {
@@ -240,6 +245,18 @@ public struct DockerClient: DockerAPI {
                 }
             }
         }
+    }
+
+    /// Docker's `seconds.nanoseconds` form for `since`/`until`.
+    static func unixTimestamp(_ time: Double) -> String {
+        var seconds = Int64(time.rounded(.down))
+        var nanoseconds = Int(((time - Double(seconds)) * 1_000_000_000).rounded())
+        if nanoseconds >= 1_000_000_000 {
+            seconds += 1
+            nanoseconds -= 1_000_000_000
+        }
+        let digits = String(nanoseconds)
+        return String(seconds) + "." + String(repeating: "0", count: max(0, 9 - digits.count)) + digits
     }
 
     public func perform(_ action: ContainerAction, containerID: String) async throws {

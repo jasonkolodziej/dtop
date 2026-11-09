@@ -39,7 +39,39 @@ struct LogFollowTests {
         #expect(request.path == "/containers/web/1/logs")
         #expect(request.query["follow"] == "1")
         #expect(request.query["tail"] == "50")
+        #expect(request.query["timestamps"] == "1")
+        #expect(request.query["since"] == nil)
         #expect(request.query["stdout"] == "1" && request.query["stderr"] == "1")
+    }
+
+    @Test("timestamps are split off each line; resuming asks for everything since the last one")
+    func timestamps() async throws {
+        let transport = MockTransport(always: MockResponse(chunks: [
+            chunkedHead, chunk(frame(1, "2024-05-01T12:34:56.5Z hello\nnot-a-time line\n")), Array("0\r\n\r\n".utf8)
+        ]))
+        var lines: [LogLine] = []
+        for try await batch in DockerClient(transport: transport).followLogs(id: "c", tail: 9, since: 1_714_566_896.5) {
+            lines += batch
+        }
+        #expect(lines.map(\.text) == ["hello", "not-a-time line"])
+        #expect(lines[0].timestamp == 1_714_566_896.5)
+        #expect(lines[1].timestamp == nil)
+        let request = try #require(transport.requests.first)
+        #expect(request.query["since"] == "1714566896.500000000")
+        #expect(request.query["tail"] == "all")
+    }
+
+    @Test("since timestamps use Docker's seconds.nanoseconds form")
+    func sinceFormat() {
+        #expect(DockerClient.unixTimestamp(0) == "0.000000000")
+        #expect(DockerClient.unixTimestamp(1_714_566_896.25) == "1714566896.250000000")
+        #expect(DockerClient.unixTimestamp(5.9999999999) == "6.000000000", "rounding carries into the seconds")
+    }
+
+    @Test("without timestamps the prefix is ordinary text")
+    func plainDecoder() {
+        var decoder = LogStreamDecoder(mode: .raw)
+        #expect(decoder.feed(Array("2024-05-01T12:34:56Z hi\n".utf8)) == [LogLine(stream: .stdout, text: "2024-05-01T12:34:56Z hi")])
     }
 
     @Test("TTY containers stream raw text")

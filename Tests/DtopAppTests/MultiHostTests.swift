@@ -95,7 +95,8 @@ struct MultiHostConfigurationTests {
     @Test("bad sections fail with the line number", arguments: [
         ("[server x]", "line 1"), ("[host]", "line 1"), ("[host a b]", "line 1"), ("[host x", "line 1"),
         ("[host x]\ntheme = dusk", "line 2"), ("[host x]\ntlsverify = sometimes", "line 2"),
-        ("[host x]\ntls = on", "needs 'endpoint")
+        ("[host x]\ntls = on", "needs 'endpoint"),
+        ("[host x]\nendpoint = tcp://a\ncontext = b", "sets both 'endpoint' and 'context'")
     ])
     func badSections(text: String, fragment: String) {
         var configuration = AppConfiguration()
@@ -413,6 +414,21 @@ struct LogStreamPolicyTests {
         #expect(LogStreamPolicy.decide(current: nil, wanted: stopped, state: .ended(nil), reconnectPending: false, isReconnect: false) == .wait)
         #expect(LogStreamPolicy.decide(current: nil, wanted: running, state: .ended(nil), reconnectPending: false, isReconnect: false) == .start,
                 "once it runs again, logs stream again")
+    }
+
+    @Test("a resumed stream drops lines it already showed; untimed lines are kept")
+    func resumeFilter() {
+        let batch = [LogLine(stream: .stdout, text: "seen", timestamp: 10), LogLine(stream: .stdout, text: "new", timestamp: 10.5),
+                     LogLine(stream: .stderr, text: "untimed")]
+        #expect(LogStreamPolicy.newLines(batch, after: 10).map(\.text) == ["new", "untimed"])
+        #expect(LogStreamPolicy.newLines(batch, after: nil) == batch)
+    }
+
+    @Test("scrolled back, new lines keep the view still, but never past the oldest kept line")
+    func scrollClamp() {
+        #expect(LogStreamPolicy.scrollBack(10, appended: 5, keptLines: 100) == 15)
+        #expect(LogStreamPolicy.scrollBack(4_998, appended: 10, keptLines: 5_000) == 5_000, "the cap dropped the old view")
+        #expect(LogStreamPolicy.scrollBack(0, appended: 0, keptLines: 0) == 0)
     }
 
     @Test("a dropped stream waits for its scheduled reconnect, which then starts it")

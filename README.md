@@ -418,7 +418,7 @@ GPU notes:
 
 What the verification labels mean:
 
-- **unit**: the 524-test suite (525 on Windows), run in CI on all three platforms (TLS tests included, against a real `openssl s_server`).
+- **unit**: the 530-test suite (531 on Windows), run in CI on all three platforms (TLS tests included, against a real `openssl s_server`).
 - **integration**: tests against a real Docker daemon on the Linux CI runner.
 - **e2e**: the real app driven in a pseudo-terminal against live daemons (including a `--tlsverify` docker:dind daemon for multi-host and TLS log streaming): real key and mouse input, with the rendered screen checked cell by cell. So far this has only been run on Linux.
 

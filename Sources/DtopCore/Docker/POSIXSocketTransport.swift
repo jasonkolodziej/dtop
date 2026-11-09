@@ -45,9 +45,9 @@ final class POSIXSocketConnection: DockerConnection, @unchecked Sendable {
         while offset < bytes.count {
             let written = bytes.withUnsafeBytes { raw -> Int in
                 #if canImport(Darwin)
-                return Darwin.send(descriptor, raw.baseAddress! + offset, bytes.count - offset, 0)
+                return Darwin.send(descriptor, raw.baseAddress!.advanced(by: offset), bytes.count - offset, 0)
                 #else
-                return send(descriptor, raw.baseAddress! + offset, bytes.count - offset, Int32(MSG_NOSIGNAL))
+                return send(descriptor, raw.baseAddress!.advanced(by: offset), bytes.count - offset, Int32(MSG_NOSIGNAL))
                 #endif
             }
             if written < 0 {

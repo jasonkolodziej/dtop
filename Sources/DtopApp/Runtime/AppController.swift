@@ -372,7 +372,11 @@ public final class AppController {
         detail.appendLogs(lines)
         detail.logState = .live
         snapshot.detail = detail
-        if !state.logFollow { state.detailScroll += lines.count }
+        // Keep the same lines on screen while scrolled back; never past the oldest kept line
+        // (the 5,000-line cap drops lines from the top).
+        if !state.logFollow {
+            state.detailScroll = LogStreamPolicy.scrollBack(state.detailScroll, appended: lines.count, keptLines: detail.logs.count)
+        }
     }
 
     private func apply(_ event: InputEvent, now: Double) {
@@ -521,11 +525,16 @@ public final class AppController {
 
         pausedLogLines.removeAll()
         var detail = existing ?? ContainerDetailData(containerID: wanted.containerID)
-        detail.logs = []
+        // Same container as before (a reconnect, or it started again): keep what is on screen
+        // and resume from the last line's timestamp instead of re-reading the tail.
+        let resumeAfter = detail.logs.last?.timestamp
+        if resumeAfter == nil {
+            detail.logs = []
+            state.detailScroll = 0
+            state.logFollow = true
+        }
         detail.logState = .live
         snapshot.detail = detail
-        state.detailScroll = 0
-        state.logFollow = true
 
         let api = sessions[wanted.host].api
         let continuation = self.continuation
@@ -534,8 +543,10 @@ public final class AppController {
         let id = wanted.containerID
         let task = Task.detached {
             do {
-                for try await batch in api.followLogs(id: id, tail: tail) {
-                    continuation.yield(.logLines(host: host, containerID: id, batch))
+                for try await batch in api.followLogs(id: id, tail: tail, since: resumeAfter) {
+                    // `since` is inclusive: drop lines already shown.
+                    let fresh = LogStreamPolicy.newLines(batch, after: resumeAfter)
+                    if !fresh.isEmpty { continuation.yield(.logLines(host: host, containerID: id, fresh)) }
                 }
                 continuation.yield(.logStreamEnded(host: host, containerID: id, error: nil))
             } catch {

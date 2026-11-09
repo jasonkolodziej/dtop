@@ -21,7 +21,8 @@ public enum PEM {
         var label: String?
         var headers: [String: String] = [:]
         var body = ""
-        for rawLine in text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" }) {
+        // Any line ending: "\n", "\r\n" (one Character in Swift) or a lone "\r".
+        for rawLine in text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
             let line = String(rawLine).trimmingWhitespace()
             if let current = label {
                 if line == "-----END \(current)-----" {

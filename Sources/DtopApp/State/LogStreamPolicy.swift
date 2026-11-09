@@ -1,3 +1,5 @@
+import DtopCore
+
 /// Decides what to do with the followed log stream when the selection, pane, host or the
 /// stream itself changes. Pure, so the rules are tested without a terminal.
 public enum LogStreamPolicy {
@@ -23,6 +25,19 @@ public enum LogStreamPolicy {
         case stop
         /// Leave things as they are (an ended stream, or a reconnect already scheduled).
         case wait
+    }
+
+    /// Lines of a resumed stream that are new. `since` is inclusive, so lines at or before the
+    /// last one already shown are dropped; lines without a timestamp are kept.
+    public static func newLines(_ batch: [LogLine], after last: Double?) -> [LogLine] {
+        guard let last else { return batch }
+        return batch.filter { ($0.timestamp ?? .infinity) > last }
+    }
+
+    /// The logs pane's scroll-back after `appended` lines arrive while the user is scrolled back:
+    /// it grows so the same lines stay on screen, but never past the oldest line kept.
+    public static func scrollBack(_ current: Int, appended: Int, keptLines: Int) -> Int {
+        max(0, min(current + appended, keptLines))
     }
 
     /// - Parameters:

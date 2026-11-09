@@ -91,8 +91,14 @@ public struct AppConfiguration: Sendable, Equatable {
                 throw ConfigurationError("dtop.conf line \(offset + 1): \(error.message)")
             }
         }
-        for (index, host) in hosts.enumerated() where host.name != nil && host.address == nil && host.context == nil {
-            throw ConfigurationError("dtop.conf: [host \(host.name ?? "")] needs 'endpoint = …' or 'context = …' (host \(index + 1))")
+        for (index, host) in hosts.enumerated() where host.name != nil {
+            if host.address == nil && host.context == nil {
+                throw ConfigurationError("dtop.conf: [host \(host.name ?? "")] needs 'endpoint = …' or 'context = …' (host \(index + 1))")
+            }
+            if host.address != nil && host.context != nil {
+                throw ConfigurationError("dtop.conf: [host \(host.name ?? "")] sets both 'endpoint' and 'context' — "
+                    + "a context already names its endpoint; keep one of them")
+            }
         }
     }
 

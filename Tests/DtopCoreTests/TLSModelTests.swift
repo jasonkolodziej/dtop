@@ -44,6 +44,17 @@ struct PEMTests {
         #expect(throws: DockerError.self) { try PEM.certificates(KeyFixtures.rsaPKCS1, file: "cert.pem") }
     }
 
+    @Test("PEM parses with CRLF and lone-CR line endings exactly as with LF")
+    func lineEndings() throws {
+        let lf = try PrivateKey.parse(pem: KeyFixtures.rsaPKCS1, file: "key.pem")
+        let crlf = KeyFixtures.rsaPKCS1.replacingOccurrences(of: "\n", with: "\r\n")
+        let cr = KeyFixtures.rsaPKCS1.replacingOccurrences(of: "\n", with: "\r")
+        #expect(try PrivateKey.parse(pem: crlf, file: "key.pem") == lf)
+        #expect(try PrivateKey.parse(pem: cr, file: "key.pem") == lf)
+        #expect(try PEM.parse(KeyFixtures.rsaLegacyEncrypted.replacingOccurrences(of: "\n", with: "\r\n"))[0]
+            .headers["Proc-Type"] == "4,ENCRYPTED")
+    }
+
     @Test("DER round-trips short and long lengths")
     func der() throws {
         for size in [0, 1, 127, 128, 255, 256, 70_000] {
