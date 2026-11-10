@@ -170,7 +170,7 @@ struct ConfigFileTests {
     func clearing() throws {
         var configuration = AppConfiguration()
         configuration.host = "x"
-        configuration.colorMode = .none
+        configuration.colorMode = ColorMode.none
         try configuration.apply(configFile: "host =\ncolor = auto")
         #expect(configuration.host == nil)
         #expect(configuration.colorMode == nil)

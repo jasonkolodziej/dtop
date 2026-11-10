@@ -40,6 +40,7 @@ enum BrandMark {
         }
     }
 
+    @discardableResult
     private static func draw(_ runs: [Run], into buffer: inout ScreenBuffer, x: Int, y: Int, base: Style,
                              theme: Theme, maxWidth: Int?) -> Int {
         var cursor = x

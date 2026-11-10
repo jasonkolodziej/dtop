@@ -138,7 +138,8 @@ final class OpenSSLLibrary: @unchecked Sendable {
             if code == 0 { break }
             var buffer = [CChar](repeating: 0, count: 256)
             errErrorString(code, &buffer, buffer.count)
-            messages.append(String(cString: buffer))
+            let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+            messages.append(String(decoding: bytes, as: UTF8.self))
         }
         return messages.isEmpty ? nil : messages.joined(separator: "; ")
     }
