@@ -83,7 +83,7 @@ struct AppViewTests {
     func containerRows() {
         let frame = render()
         let lines = frame.buffer.lines
-        let cacheRow = try? #require(lines.firstIndex { $0.contains("cache") && $0.contains("redis") })
+        let cacheRow = lines.firstIndex { $0.contains("cache") && $0.contains("redis") }
         #expect(cacheRow != nil)
         if let cacheRow {
             #expect(lines[cacheRow].contains("40.0"))
