@@ -3,6 +3,8 @@
 //! `docker compose` with the working directory and files recorded in the labels.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use crate::api::ContainerAction;
@@ -202,12 +204,21 @@ pub trait CommandRunning: Send + Sync {
         let _ = timeout;
         self.run(invocation)
     }
+
+    /// Processes `run_with_timeout` killed that have not exited yet. A process blocked inside
+    /// a driver call (uninterruptible sleep) cannot die until that call returns, so callers
+    /// should not start another one while this is above zero.
+    fn abandoned_processes(&self) -> usize {
+        0
+    }
 }
 
 /// Spawns processes with `std::process::Command`, resolving the executable on `PATH`.
 pub struct ProcessCommandRunner {
     pub path: String,
     pub platform: Platform,
+    /// Killed-but-not-yet-exited children, each waited for on its own thread.
+    abandoned: Arc<AtomicUsize>,
 }
 
 impl Default for ProcessCommandRunner {
@@ -218,6 +229,7 @@ impl Default for ProcessCommandRunner {
         ProcessCommandRunner {
             path,
             platform: Platform::current(),
+            abandoned: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -258,19 +270,50 @@ fn launch_failed(invocation: &CommandInvocation, error: &std::io::Error) -> Dock
     ))
 }
 
-/// Reads a child's pipe to the end on its own thread, so a full pipe never blocks the child.
-fn drain<R: std::io::Read + Send + 'static>(
-    pipe: Option<R>,
-) -> Option<std::thread::JoinHandle<Vec<u8>>> {
-    let mut pipe = pipe?;
-    std::thread::Builder::new()
-        .name("dtop-command-output".into())
-        .spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes);
-            bytes
-        })
-        .ok()
+/// Reads a child's pipe to the end on its own thread, so a full pipe never blocks the child;
+/// the bytes arrive on the returned channel once the pipe closes.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    match pipe {
+        Some(mut pipe) => {
+            // If the thread cannot start, `tx` is dropped with the closure and the output reads
+            // as empty.
+            let _ = std::thread::Builder::new()
+                .name("dtop-command-output".into())
+                .spawn(move || {
+                    let mut bytes = Vec::new();
+                    let _ = pipe.read_to_end(&mut bytes);
+                    let _ = tx.send(bytes);
+                });
+        }
+        None => {
+            let _ = tx.send(Vec::new());
+        }
+    }
+    rx
+}
+
+impl ProcessCommandRunner {
+    /// Kills `child` and waits for it on another thread: a process stuck in a driver call keeps
+    /// running until the call returns, and waiting here would block the caller all the same.
+    fn abandon(&self, mut child: std::process::Child) {
+        let _ = child.kill();
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        self.abandoned.fetch_add(1, Ordering::SeqCst);
+        let abandoned = Arc::clone(&self.abandoned);
+        let reaper = std::thread::Builder::new()
+            .name("dtop-command-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+                abandoned.fetch_sub(1, Ordering::SeqCst);
+            });
+        if reaper.is_err() {
+            // The child stays a zombie until dtop exits; it is no longer counted as running.
+            self.abandoned.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 impl CommandRunning for ProcessCommandRunner {
@@ -302,24 +345,25 @@ impl CommandRunning for ProcessCommandRunner {
         let stdout = drain(child.stdout.take());
         let stderr = drain(child.stderr.take());
         let deadline = Instant::now() + timeout;
+        let timed_out = |what: &str| {
+            DockerError::TimedOut(format!(
+                "{} ({what} after {} s)",
+                invocation.display_string(),
+                timeout.as_secs_f64()
+            ))
+        };
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // The output threads end once the killed child's pipes close; they are not
-                    // joined, in case a grandchild still holds a pipe open.
-                    return Err(DockerError::TimedOut(format!(
-                        "{} (stopped after {} s)",
-                        invocation.display_string(),
-                        timeout.as_secs_f64()
-                    )));
+                    // Returns at the deadline even if the kill cannot take effect yet. The
+                    // output threads end when the pipes close and are not waited for.
+                    self.abandon(child);
+                    return Err(timed_out("stopped"));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(10)),
                 Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    self.abandon(child);
                     return Err(DockerError::Io(format!(
                         "waiting for {} failed: {e}",
                         invocation.display_string()
@@ -327,15 +371,26 @@ impl CommandRunning for ProcessCommandRunner {
                 }
             }
         };
-        let collect = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
-            handle.and_then(|h| h.join().ok()).unwrap_or_default()
+        // A process it started can still hold the pipes open after it exits: the deadline
+        // covers collecting the output too.
+        let collect = |pipe: &mpsc::Receiver<Vec<u8>>| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match pipe.recv_timeout(remaining) {
+                Ok(bytes) => Ok(bytes),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Ok(Vec::new()),
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(timed_out("output still open")),
+            }
         };
-        let mut text = String::from_utf8_lossy(&collect(stdout)).into_owned();
-        text.push_str(&String::from_utf8_lossy(&collect(stderr)));
+        let mut text = String::from_utf8_lossy(&collect(&stdout)?).into_owned();
+        text.push_str(&String::from_utf8_lossy(&collect(&stderr)?));
         Ok(CommandResult {
             exit_code: status.code().unwrap_or(-1),
             output: text,
         })
+    }
+
+    fn abandoned_processes(&self) -> usize {
+        self.abandoned.load(Ordering::SeqCst)
     }
 }
 
@@ -713,6 +768,43 @@ mod tests {
             ProcessCommandRunner::default().run_with_timeout(&slow, Duration::from_millis(300));
         assert!(
             matches!(outcome, Err(DockerError::TimedOut(_))),
+            "{outcome:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn killed_commands_are_reaped_off_the_calling_thread() {
+        let runner = ProcessCommandRunner::default();
+        let slow = if cfg!(windows) {
+            invocation("ping", &["-n", "30", "127.0.0.1"])
+        } else {
+            invocation("sleep", &["30"])
+        };
+        assert!(runner
+            .run_with_timeout(&slow, Duration::from_millis(200))
+            .is_err());
+        // An ordinary process dies at once; the reaper then stops counting it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while runner.abandoned_processes() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the killed command was never reaped"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_holding_the_output_open_cannot_outlast_the_deadline() {
+        // `sh` exits at once, but the background `sleep` inherits stdout and keeps it open.
+        let leaky = invocation("sh", &["-c", "sleep 30 & echo started"]);
+        let started = Instant::now();
+        let outcome =
+            ProcessCommandRunner::default().run_with_timeout(&leaky, Duration::from_millis(500));
+        assert!(
+            matches!(outcome, Err(DockerError::TimedOut(ref m)) if m.contains("output still open")),
             "{outcome:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(10));

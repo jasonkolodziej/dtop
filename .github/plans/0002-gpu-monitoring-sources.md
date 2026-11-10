@@ -83,7 +83,8 @@ Option 3, behind a `GPUCollecting` protocol:
 - **A hung driver can make `nvidia-smi` block**, and it runs inside the host refresh. The Rust
   version bounds each query to 5 s, kills it after that, keeps the last known GPUs on screen
   without readings, and skips `nvidia-smi` for 30 s, so a wedged driver cannot stall container
-  monitoring (amended 2026-11-09).
+  monitoring. A killed process stuck in the driver (uninterruptible sleep) is reaped on its own
+  thread, and no new query starts until it exits (amended 2026-11-09).
 - **Intel host utilization depends on the same fdinfo access.** Intel has no busy-percent
   file, so device utilization and memory are sums over readable clients. When any process
   cannot be read, the Rust version reports them as unknown rather than an undercount, and the

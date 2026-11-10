@@ -522,7 +522,8 @@ GPU notes:
    namespace). It does not work when dtop connects to a remote daemon.
 5. Each `nvidia-smi` query may take 5 seconds in the Rust version. One that takes longer (a hung
    NVIDIA driver) is stopped, the GPUs stay listed as `n/a` with the reason in the GPU box, and
-   `nvidia-smi` is tried again 30 seconds later, so container monitoring keeps updating.
+   `nvidia-smi` is tried again 30 seconds later (and not while a stopped one is still stuck in
+   the driver), so container monitoring keeps updating.
 6. None of this has been tested on real GPU hardware yet; this environment has no GPU.
 6. Linux uses OpenSSL (loaded at runtime), macOS Network.framework, Windows SChannel. All three
    negotiate TLS 1.3 where the OS supports it (Windows 11 / Server 2022) and fall back to 1.2.

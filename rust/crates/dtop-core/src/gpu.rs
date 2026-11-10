@@ -487,11 +487,47 @@ impl DrmUsageTracker {
     }
 }
 
+/// The result of a lookup that tells "not there" from "not allowed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Access<T> {
+    Found(T),
+    /// Gone or never there, e.g. a process or fd that ended during the scan.
+    Missing,
+    /// The kernel refused (another user's process without root or `CAP_SYS_PTRACE`).
+    Denied,
+}
+
+impl<T> Access<T> {
+    fn from_io(result: std::io::Result<T>) -> Self {
+        match result {
+            Ok(value) => Access::Found(value),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Access::Denied,
+            Err(_) => Access::Missing,
+        }
+    }
+
+    fn from_option(value: Option<T>) -> Self {
+        value.map_or(Access::Missing, Access::Found)
+    }
+}
+
 /// File access the collector needs, injectable for tests against a fake `/sys` + `/proc`.
 pub trait GpuFileSystem: Send + Sync {
     fn read(&self, path: &str) -> Option<String>;
     fn list(&self, path: &str) -> Option<Vec<String>>;
     fn read_link(&self, path: &str) -> Option<String>;
+
+    /// `list`, `read_link` and `read` that report permission denials, which make DRM totals
+    /// incomplete; plain failures (the process exited meanwhile) do not.
+    fn list_access(&self, path: &str) -> Access<Vec<String>> {
+        Access::from_option(self.list(path))
+    }
+    fn read_link_access(&self, path: &str) -> Access<String> {
+        Access::from_option(self.read_link(path))
+    }
+    fn read_access(&self, path: &str) -> Access<String> {
+        Access::from_option(self.read(path))
+    }
 }
 
 pub struct LocalGpuFileSystem;
@@ -516,6 +552,22 @@ impl GpuFileSystem for LocalGpuFileSystem {
         std::fs::read_link(path)
             .ok()
             .map(|p| p.to_string_lossy().into_owned())
+    }
+
+    fn list_access(&self, path: &str) -> Access<Vec<String>> {
+        Access::from_io(std::fs::read_dir(path).map(|entries| {
+            entries
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .collect()
+        }))
+    }
+
+    fn read_link_access(&self, path: &str) -> Access<String> {
+        Access::from_io(std::fs::read_link(path).map(|p| p.to_string_lossy().into_owned()))
+    }
+
+    fn read_access(&self, path: &str) -> Access<String> {
+        Access::from_io(std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()))
     }
 }
 
@@ -655,6 +707,9 @@ impl SystemGpuCollector {
 
     /// The last known NVIDIA GPUs with their readings cleared ("n/a", not stale numbers).
     fn unanswered_nvidia_devices(&self, result: &mut GpuSample) {
+        // Whatever ran on the NVIDIA GPUs this time is unknown, so containers without other
+        // GPU entries are unknown too, not idle (also on hosts with AMD/Intel GPUs as well).
+        result.process_attribution_complete = false;
         let known = self
             .nvidia_last_devices
             .lock()
@@ -669,7 +724,6 @@ impl SystemGpuCollector {
             temperature: None,
             ..d
         }));
-        result.process_attribution_complete = false;
     }
 
     fn nvidia_smi_hung_issue(&self, retry_in: f64) -> String {
@@ -701,6 +755,16 @@ impl SystemGpuCollector {
             .filter(|at| *at > now);
         if let Some(at) = waiting {
             result.issues.push(self.nvidia_smi_hung_issue(at - now));
+            return self.unanswered_nvidia_devices(result);
+        }
+        // A killed nvidia-smi still stuck in the driver: starting another would only pile up
+        // stuck processes.
+        if self.runner.abandoned_processes() > 0 {
+            result.issues.push(
+                "nvidia-smi is still stuck in the NVIDIA driver after being stopped; waiting \
+                 for it to exit"
+                    .into(),
+            );
             return self.unanswered_nvidia_devices(result);
         }
         let output = match self.run(
@@ -868,28 +932,45 @@ impl SystemGpuCollector {
             let Ok(pid) = entry.parse::<i64>() else {
                 continue;
             };
-            let Some(fds) = self
+            let fds = match self
                 .file_system
-                .list(&format!("{}/{pid}/fd", self.proc_root))
-            else {
-                unreadable += 1;
-                continue;
-            };
-            for fd in fds {
-                let Some(target) = self
-                    .file_system
-                    .read_link(&format!("{}/{pid}/fd/{fd}", self.proc_root))
-                else {
+                .list_access(&format!("{}/{pid}/fd", self.proc_root))
+            {
+                Access::Found(fds) => fds,
+                Access::Denied => {
+                    unreadable += 1;
                     continue;
+                }
+                // Exited during the scan.
+                Access::Missing => continue,
+            };
+            // A process counts once however many of its fds were refused.
+            let mut denied = false;
+            for fd in fds {
+                let target = match self
+                    .file_system
+                    .read_link_access(&format!("{}/{pid}/fd/{fd}", self.proc_root))
+                {
+                    Access::Found(target) => target,
+                    Access::Denied => {
+                        denied = true;
+                        continue;
+                    }
+                    Access::Missing => continue,
                 };
                 if !target.starts_with("/dev/dri/") {
                     continue;
                 }
-                let Some(text) = self
+                let text = match self
                     .file_system
-                    .read(&format!("{}/{pid}/fdinfo/{fd}", self.proc_root))
-                else {
-                    continue;
+                    .read_access(&format!("{}/{pid}/fdinfo/{fd}", self.proc_root))
+                {
+                    Access::Found(text) => text,
+                    Access::Denied => {
+                        denied = true;
+                        continue;
+                    }
+                    Access::Missing => continue,
                 };
                 let Some(client) = DrmClient::parse(&text) else {
                     continue;
@@ -900,6 +981,9 @@ impl SystemGpuCollector {
                 }
                 owner.insert(client.key(), pid);
                 clients.push(client);
+            }
+            if denied {
+                unreadable += 1;
             }
         }
         let usage = match self.tracker.lock() {
@@ -1323,6 +1407,39 @@ mod tests {
 
     struct FakeFs(BTreeMap<String, String>, BTreeMap<String, String>);
 
+    /// A `FakeFs` where the listed paths are refused, as `/proc` does for other users.
+    struct DenyingFs(FakeFs, std::collections::BTreeSet<String>);
+
+    impl GpuFileSystem for DenyingFs {
+        fn read(&self, path: &str) -> Option<String> {
+            self.0.read(path)
+        }
+        fn list(&self, path: &str) -> Option<Vec<String>> {
+            self.0.list(path)
+        }
+        fn read_link(&self, path: &str) -> Option<String> {
+            self.0.read_link(path)
+        }
+        fn list_access(&self, path: &str) -> Access<Vec<String>> {
+            if self.1.contains(path) {
+                return Access::Denied;
+            }
+            Access::from_option(self.0.list(path))
+        }
+        fn read_link_access(&self, path: &str) -> Access<String> {
+            if self.1.contains(path) {
+                return Access::Denied;
+            }
+            Access::from_option(self.0.read_link(path))
+        }
+        fn read_access(&self, path: &str) -> Access<String> {
+            if self.1.contains(path) {
+                return Access::Denied;
+            }
+            Access::from_option(self.0.read(path))
+        }
+    }
+
     impl GpuFileSystem for FakeFs {
         fn read(&self, path: &str) -> Option<String> {
             self.0.get(path).cloned()
@@ -1406,9 +1523,13 @@ mod tests {
 
     /// `nvidia-smi` that answers device queries from `devices` and hangs (times out) while
     /// `hung` is set. Counts the queries it receives.
+    #[derive(Default)]
     struct ScriptedSmi {
         hung: std::sync::atomic::AtomicBool,
+        /// Only `pmon` hangs.
+        pmon_hung: std::sync::atomic::AtomicBool,
         calls: std::sync::atomic::AtomicUsize,
+        abandoned: std::sync::atomic::AtomicUsize,
     }
 
     impl CommandRunning for ScriptedSmi {
@@ -1422,7 +1543,8 @@ mod tests {
         ) -> Result<CommandResult> {
             use std::sync::atomic::Ordering;
             self.calls.fetch_add(1, Ordering::SeqCst);
-            if self.hung.load(Ordering::SeqCst) {
+            let pmon = invocation.arguments[0] == "pmon";
+            if self.hung.load(Ordering::SeqCst) || (pmon && self.pmon_hung.load(Ordering::SeqCst)) {
                 return Err(DockerError::TimedOut(invocation.display_string()));
             }
             let output = if invocation.arguments[0].starts_with("--query-gpu") {
@@ -1435,15 +1557,87 @@ mod tests {
                 output: output.into(),
             })
         }
+        fn abandoned_processes(&self) -> usize {
+            self.abandoned.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn nvidia_collector(smi: &Arc<ScriptedSmi>, fs: FakeFs) -> SystemGpuCollector {
+        SystemGpuCollector::new(
+            Platform::Linux,
+            Some("/usr/bin/nvidia-smi".into()),
+            Arc::new(fs),
+            Arc::clone(smi) as Arc<dyn CommandRunning>,
+            "/proc",
+            "/sys/class/drm",
+        )
+    }
+
+    #[test]
+    fn partial_nvidia_answers_leave_containers_unknown_not_idle() {
+        use std::sync::atomic::Ordering;
+        // pmon times out after the device query worked.
+        let smi = Arc::new(ScriptedSmi::default());
+        smi.pmon_hung.store(true, Ordering::SeqCst);
+        let collector = nvidia_collector(&smi, FakeFs(BTreeMap::new(), BTreeMap::new()));
+        let sample = collector.sample(0.0);
+        assert_eq!(sample.devices[0].utilization, Some(45.0));
+        assert!(!sample.process_attribution_complete);
+
+        // The very first query times out on a host that also has an AMD GPU, whose DRM data is
+        // complete: NVIDIA usage is unknown, so attribution is incomplete.
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert(
+            "/sys/class/drm/card0/device/vendor".into(),
+            "0x1002\n".into(),
+        );
+        files.insert(
+            "/sys/class/drm/card0/device/uevent".into(),
+            "PCI_SLOT_NAME=0000:03:00.0\n".into(),
+        );
+        files.insert(
+            "/sys/class/drm/card0/device/gpu_busy_percent".into(),
+            "7\n".into(),
+        );
+        let smi = Arc::new(ScriptedSmi::default());
+        smi.hung.store(true, Ordering::SeqCst);
+        let collector = nvidia_collector(&smi, FakeFs(files, BTreeMap::new()));
+        let sample = collector.sample(0.0);
+        assert_eq!(sample.devices.len(), 1);
+        assert_eq!(sample.devices[0].utilization, Some(7.0));
+        assert!(!sample.process_attribution_complete);
+    }
+
+    #[test]
+    fn no_new_nvidia_smi_starts_while_a_killed_one_is_stuck() {
+        use std::sync::atomic::Ordering;
+        let smi = Arc::new(ScriptedSmi::default());
+        let collector = nvidia_collector(&smi, FakeFs(BTreeMap::new(), BTreeMap::new()));
+        collector.sample(0.0);
+        smi.hung.store(true, Ordering::SeqCst);
+        collector.sample(1.0);
+        let calls = smi.calls.load(Ordering::SeqCst);
+        // The killed process never exits (uninterruptible sleep in the driver).
+        smi.abandoned.store(1, Ordering::SeqCst);
+        smi.hung.store(false, Ordering::SeqCst);
+        let stuck = collector.sample(1.0 + NVIDIA_SMI_RETRY_SECONDS + 5.0);
+        assert_eq!(smi.calls.load(Ordering::SeqCst), calls);
+        assert!(
+            stuck.issues[0].contains("still stuck"),
+            "{:?}",
+            stuck.issues
+        );
+        assert_eq!(stuck.devices[0].utilization, None);
+        // Once it exits, the next refresh queries again.
+        smi.abandoned.store(0, Ordering::SeqCst);
+        let recovered = collector.sample(1.0 + NVIDIA_SMI_RETRY_SECONDS + 7.0);
+        assert_eq!(recovered.devices[0].utilization, Some(45.0));
     }
 
     #[test]
     fn a_hung_nvidia_smi_is_stopped_and_left_alone_until_the_retry() {
         use std::sync::atomic::Ordering;
-        let smi = Arc::new(ScriptedSmi {
-            hung: false.into(),
-            calls: 0.into(),
-        });
+        let smi = Arc::new(ScriptedSmi::default());
         let collector = SystemGpuCollector::new(
             Platform::Linux,
             Some("/usr/bin/nvidia-smi".into()),
@@ -1489,10 +1683,11 @@ mod tests {
         assert!(recovered.issues.is_empty(), "{:?}", recovered.issues);
     }
 
-    #[test]
-    fn intel_usage_is_unknown_when_some_processes_cannot_be_read() {
+    /// Two samples one second apart of an Intel GPU whose client (pid 42) spends 25% of that
+    /// second busy, with `denied` paths refused and `/proc/<extra>` processes listed.
+    fn intel_sample(denied: &[&str], extra: &[&str]) -> GpuSample {
         let fdinfo = |ns: u64| {
-            format!("drm-driver: i915\ndrm-client-id: 3\ndrm-pdev: 0000:00:02.0\ndrm-engine-render: {ns} ns\ndrm-resident-system: 4 MiB\n")
+            format!("drm-driver: i915\ndrm-client-id: 3\ndrm-pdev: 0000:00:02.0\ndrm-engine-render: {ns} ns\ndrm-resident-local0: 4 MiB\n")
         };
         let mut files: BTreeMap<String, String> = BTreeMap::new();
         files.insert(
@@ -1503,31 +1698,40 @@ mod tests {
             "/sys/class/drm/card0/device/uevent".into(),
             "PCI_SLOT_NAME=0000:00:02.0\n".into(),
         );
-        files.insert("/proc/42/fdinfo/5".into(), fdinfo(0));
-        // Process 1 is listed but its fds cannot be read (another user's, e.g. root's).
-        files.insert("/proc/1/cgroup".into(), "0::/init.scope\n".into());
+        for pid in extra {
+            files.insert(format!("/proc/{pid}/cgroup"), "0::/init.scope\n".into());
+        }
         let links: BTreeMap<String, String> = [(
             "/proc/42/fd/5".to_string(),
             "/dev/dri/renderD128".to_string(),
         )]
         .into();
+        let denied: std::collections::BTreeSet<String> =
+            denied.iter().map(|d| d.to_string()).collect();
+        let at = |ns| {
+            let mut files = files.clone();
+            files.insert("/proc/42/fdinfo/5".into(), fdinfo(ns));
+            Arc::new(DenyingFs(FakeFs(files, links.clone()), denied.clone()))
+        };
         let collector = SystemGpuCollector::new(
             Platform::Linux,
             None,
-            Arc::new(FakeFs(files.clone(), links.clone())),
+            at(0),
             Arc::new(NoRunner),
             "/proc",
             "/sys/class/drm",
         );
         collector.sample(0.0);
-        files.insert("/proc/42/fdinfo/5".into(), fdinfo(250_000_000));
         let collector = SystemGpuCollector {
-            file_system: Arc::new(FakeFs(files, links)),
+            file_system: at(250_000_000),
             ..collector
         };
-        let sample = collector.sample(1.0);
+        collector.sample(1.0)
+    }
+
+    fn assert_intel_unknown(sample: &GpuSample) {
         assert_eq!(sample.devices.len(), 1);
-        // Only this user's 25% was visible; the device total is unknown, not 25%.
+        // Only the readable client's 25% was visible; the device total is unknown, not 25%.
         assert_eq!(sample.devices[0].utilization, None);
         assert_eq!(sample.devices[0].memory_used, None);
         assert!(!sample.process_attribution_complete);
@@ -1536,6 +1740,26 @@ mod tests {
             "{:?}",
             sample.issues
         );
+    }
+
+    #[test]
+    fn intel_usage_is_unknown_when_some_processes_cannot_be_read() {
+        // Another user's process whose fd directory is refused.
+        assert_intel_unknown(&intel_sample(&["/proc/1/fd"], &["1"]));
+        // A listable fd directory whose DRM fdinfo is refused.
+        assert_intel_unknown(&intel_sample(&["/proc/42/fdinfo/5"], &[]));
+        // A refused fd link.
+        assert_intel_unknown(&intel_sample(&["/proc/42/fd/5"], &[]));
+    }
+
+    #[test]
+    fn processes_that_exit_during_the_scan_do_not_make_intel_usage_unknown() {
+        // Process 7 is listed but its fd directory is gone by the time it is read.
+        let sample = intel_sample(&[], &["7"]);
+        assert!((sample.devices[0].utilization.unwrap() - 25.0).abs() < 1e-9);
+        assert_eq!(sample.devices[0].memory_used, Some(4 * 1_048_576));
+        assert!(sample.process_attribution_complete);
+        assert!(sample.issues.is_empty(), "{:?}", sample.issues);
     }
 
     #[test]
