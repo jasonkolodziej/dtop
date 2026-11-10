@@ -75,7 +75,12 @@ Option 3, behind a `GPUCollecting` protocol:
   needs only the driver and, for NVIDIA, `nvidia-smi` on `PATH`.
 - **Per-container AMD/Intel needs root**, because reading other users' fdinfo requires it.
   Without root, attribution is marked incomplete: those containers show `-`, not `0`, and the
-  GPU box says why.
+  GPU box says why. Instead of root, the binary can carry **both** `CAP_DAC_READ_SEARCH` (the
+  `/proc/<pid>/fd` and `fdinfo` directories are mode `0500`, owned by the process's user) and
+  `CAP_SYS_PTRACE` (the ptrace access check on reading them); one alone is not enough.
+  `setcap cap_dac_read_search,cap_sys_ptrace+ep` and running under `sudo` (with
+  `--host unix:///run/user/<uid>/docker.sock` for rootless Docker) were both confirmed on a
+  rootless-Docker host with an AMD integrated GPU (amended 2026-11-10).
 - **Per-container attribution needs dtop on the Docker host.** It relies on the host PID
   namespace, so it does nothing for remote daemons.
 - **Process cost**: `nvidia-smi` is started up to three times per refresh. If that proves too
@@ -89,7 +94,8 @@ Option 3, behind a `GPUCollecting` protocol:
   file, so device utilization and memory are sums over readable clients. When any process
   cannot be read, the Rust version reports them as unknown rather than an undercount, and the
   GPU box says root is needed. Group membership (`render`, `video`) does not help: fdinfo is
-  guarded by ptrace access checks, not by the device node's permissions (amended 2026-11-09).
+  guarded by directory permissions and ptrace access checks, not by the device node's
+  permissions (amended 2026-11-09).
 - **ROCm compute bypasses fdinfo engine time.** KFD user-mode queues don't go through the DRM
   scheduler, so ROCm work shows in the device's `gpu_busy_percent` but not in per-process
   `drm-engine-*`. The Rust version also reads amdkfd's world-readable

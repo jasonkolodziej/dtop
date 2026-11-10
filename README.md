@@ -510,12 +510,34 @@ GPU notes:
 1. On Windows, containers run inside Docker Desktop's VM, so GPU work can't be attributed to
    individual containers. AMD and Intel on Windows are not supported yet; they would need Windows
    performance counters.
-2. Per-container AMD/Intel usage is read from other processes' `/proc/<pid>/fdinfo`, which needs
-   root (or `CAP_SYS_PTRACE`); membership in the `render` or `video` groups does not grant it.
-   Without root, dtop still shows the GPU graph and says in the GPU box why per-container
-   values are missing. Intel GPUs have no busy-percent file, so their utilization is summed
-   from those same fdinfo files: without root, the Rust version shows it as `n/a` instead of a
-   number that leaves out other users' processes.
+2. Per-container AMD/Intel usage is read from other processes' `/proc/<pid>/fd` and
+   `/proc/<pid>/fdinfo`. The kernel guards those twice: the directories are mode `0500`, owned
+   by the process's user (passing that takes `CAP_DAC_READ_SEARCH`), and reading them is a
+   ptrace access check (`CAP_SYS_PTRACE`). So dtop needs root or **both** capabilities;
+   `CAP_SYS_PTRACE` alone is not enough, and membership in the `render` or `video` groups
+   does not help. Without them, dtop still shows the GPU graph and says in the GPU box why
+   per-container values are missing. Intel GPUs have no busy-percent file, so their
+   utilization is summed from those same fdinfo files: without that access, the Rust version
+   shows it as `n/a` instead of a number that leaves out other users' processes.
+
+   Either of these works; both were confirmed on a Linux host running rootless Docker with an
+   AMD integrated GPU:
+
+   ```bash
+   # Give the binary the two capabilities (re-run after every rebuild, which replaces the
+   # file; capabilities are ignored on filesystems mounted nosuid).
+   sudo setcap cap_dac_read_search,cap_sys_ptrace+ep ./target/release/dtop
+   ./target/release/dtop
+   ```
+
+   ```bash
+   # Or run as root. With rootless Docker, root does not find your user's socket by itself,
+   # so name it.
+   sudo ./target/release/dtop --host unix:///run/user/$(id -u)/docker.sock
+   ```
+
+   `CAP_DAC_READ_SEARCH` lets the binary read any file on the system, so give it only to a
+   binary you trust, or prefer `sudo` for occasional use.
 
    ROCm compute work bypasses the kernel scheduler that fdinfo's busy counters come from, so
    the Rust version also reads amdkfd's world-readable `/sys/class/kfd/kfd/proc/<pid>/`. Each

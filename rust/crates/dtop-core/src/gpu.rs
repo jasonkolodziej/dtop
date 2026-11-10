@@ -518,7 +518,8 @@ pub enum Access<T> {
     Found(T),
     /// Gone or never there, e.g. a process or fd that ended during the scan.
     Missing,
-    /// The kernel refused (another user's process without root or `CAP_SYS_PTRACE`).
+    /// The kernel refused: another user's process, read without root or without both
+    /// `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`.
     Denied,
 }
 
@@ -1079,11 +1080,11 @@ impl SystemGpuCollector {
         if unreadable > 0 {
             issues.push(if has_intel {
                 format!(
-                    "Intel GPU usage and per-container GPU usage need root ({unreadable} processes were not readable)"
+                    "Intel GPU usage and per-container GPU usage need root, or cap_dac_read_search and cap_sys_ptrace ({unreadable} processes were not readable)"
                 )
             } else {
                 format!(
-                    "per-container AMD/Intel GPU usage needs root ({unreadable} processes were not readable)"
+                    "per-container AMD/Intel GPU usage needs root, or cap_dac_read_search and cap_sys_ptrace ({unreadable} processes were not readable)"
                 )
             });
         }
