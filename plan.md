@@ -152,6 +152,11 @@ The Rust port and terminal UI choice are recorded in [ADR 0004](.github/plans/00
   TLS daemon rendered CPU and memory samples for all 120 in 1.44 seconds, including the one-second
   sampling interval (28.6 MB maximum RSS). A separate fake-API test covers 512 containers and
   asserts a maximum of eight concurrent stats requests.
+- `dtop --once` on a Linux host with rootless Docker and an AMD integrated GPU reports the
+  device's utilization and VRAM from sysfs. Reading other users' fdinfo there needs root or
+  both `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`: `setcap cap_dac_read_search,cap_sys_ptrace+ep`
+  and `sudo … --host unix:///run/user/<uid>/docker.sock` were both confirmed to work
+  (`CAP_SYS_PTRACE` alone was not enough).
 - `dtop --once` reports an actual Apple Silicon GPU sample. Prior manual pseudo-terminal checks
   also covered graphs, tabs, Compose, filtering, help, processes and confirmations.
 

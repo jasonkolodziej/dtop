@@ -4,15 +4,16 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
-use dtop_core::gpu::SystemGpuCollector;
-use dtop_core::host::{home_directory, resolve_hosts, HostEnvironment};
+use dtop_core::gpu::{GpuCollecting, SystemGpuCollector};
+use dtop_core::gpu_exporter::{ExporterGpuCollector, ExporterUrl};
+use dtop_core::host::{home_directory, resolve_hosts, DockerHost, HostEnvironment};
 use dtop_core::platform::{join_path, Platform};
 use dtop_core::tls::client_for_host;
 use dtop_core::DockerApi;
 use dtop_ui::theme::serialize_theme;
 use dtop_ui::{ColorMode, Terminal, TerminalError};
 
-use crate::config::{AppConfiguration, ConfigurationError, RunMode, USAGE};
+use crate::config::{AppConfiguration, ConfigurationError, GpuMetricsSource, RunMode, USAGE};
 use crate::controller::{AppController, ControllerOptions, HostConnection};
 use crate::once;
 use crate::refresher::{DataRefresher, RefresherOptions};
@@ -197,18 +198,30 @@ fn connect(
     } else {
         None
     };
-    // GPU usage is measured on this machine, so it belongs to the first local daemon.
-    let gpu_host = resolved.hosts.iter().position(|h| h.endpoint.is_local());
+    let exporters = if configuration.gpu {
+        exporters_by_host(&configuration.gpu_metrics, &resolved.hosts)?
+    } else {
+        HashMap::new()
+    };
+    // GPU usage is measured on this machine, so it belongs to the first local daemon (one
+    // whose GPUs don't come from an exporter).
+    let gpu_host = resolved
+        .hosts
+        .iter()
+        .enumerate()
+        .position(|(i, h)| h.endpoint.is_local() && !exporters.contains_key(&i));
     let mut connections = Vec::new();
     for (index, host) in resolved.hosts.into_iter().enumerate() {
         let client = client_for_host(&host, 30).map_err(|e| e.to_string())?;
         let api: Arc<dyn DockerApi> = Arc::new(client);
         let options = RefresherOptions {
             host: Some(host.clone()),
-            gpu_collector: if Some(index) == gpu_host {
-                gpu.clone()
-            } else {
-                None
+            gpu_collector: match exporters.get(&index) {
+                Some(url) => {
+                    Some(Arc::new(ExporterGpuCollector::new(url.clone())) as Arc<dyn GpuCollecting>)
+                }
+                None if Some(index) == gpu_host => gpu.clone(),
+                None => None,
             },
             history_size: configuration.history_size,
             ..RefresherOptions::default()
@@ -225,6 +238,37 @@ fn connect(
         });
     }
     Ok((connections, resolved.warnings))
+}
+
+/// Which host each `--gpu-metrics` exporter belongs to (by index): the named host, or the
+/// first one. A command-line name that matches no host is an error; a `dtop.conf` entry for a
+/// host the command line left out is ignored. A later entry for the same host wins.
+fn exporters_by_host(
+    sources: &[GpuMetricsSource],
+    hosts: &[DockerHost],
+) -> Result<HashMap<usize, ExporterUrl>, String> {
+    let mut exporters = HashMap::new();
+    for source in sources {
+        let index = match &source.host {
+            None => Some(0),
+            Some(name) => hosts.iter().position(|h| &h.name == name),
+        };
+        match index {
+            Some(index) => {
+                exporters.insert(index, source.url.clone());
+            }
+            None if source.from_command_line => {
+                let names: Vec<&str> = hosts.iter().map(|h| h.name.as_str()).collect();
+                return Err(format!(
+                    "--gpu-metrics names host '{}', but the hosts are {} — use one of those names, or leave the name out for the first host",
+                    source.host.as_deref().unwrap_or_default(),
+                    names.join(", ")
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(exporters)
 }
 
 /// Two refreshes one second apart so CPU and I/O rates have a baseline; every host in parallel.
@@ -303,6 +347,41 @@ mod tests {
     use super::*;
     use dtop_core::transport::{Connection, Transport};
     use dtop_core::{DockerClient, DockerEndpoint, DockerHost, Result};
+
+    #[test]
+    fn gpu_exporters_attach_to_the_named_or_first_host() {
+        let host = |name: &str| {
+            DockerHost::new(
+                name,
+                DockerEndpoint::Tcp {
+                    host: format!("{name}.example"),
+                    port: 2376,
+                },
+            )
+        };
+        let hosts = vec![host("a"), host("b")];
+        let source = |name: Option<&str>, url: &str, cli: bool| GpuMetricsSource {
+            host: name.map(str::to_string),
+            url: ExporterUrl::parse(url).unwrap(),
+            from_command_line: cli,
+        };
+        let exporters = exporters_by_host(
+            &[
+                source(None, "http://first:9400", true),
+                source(Some("b"), "http://b:9400", true),
+                // A dtop.conf entry for a host this run does not monitor.
+                source(Some("gone"), "http://gone:9400", false),
+            ],
+            &hosts,
+        )
+        .unwrap();
+        assert_eq!(exporters.len(), 2);
+        assert_eq!(exporters[&0].host, "first");
+        assert_eq!(exporters[&1].host, "b");
+        let error =
+            exporters_by_host(&[source(Some("nope"), "http://x:9400", true)], &hosts).unwrap_err();
+        assert!(error.contains("the hosts are a, b"), "{error}");
+    }
 
     struct PanickingTransport {
         endpoint: DockerEndpoint,

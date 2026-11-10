@@ -11,6 +11,7 @@ pub mod endpoint;
 pub mod error;
 pub mod format;
 pub mod gpu;
+pub mod gpu_exporter;
 pub mod host;
 pub mod http;
 pub mod json;

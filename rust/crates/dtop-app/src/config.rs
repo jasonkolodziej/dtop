@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use dtop_core::gpu_exporter::ExporterUrl;
 use dtop_core::host::{HostRequest, TlsRequest};
 use dtop_core::platform::{join_path, Platform};
 use dtop_ui::ColorMode;
@@ -36,6 +37,36 @@ fn err<T>(message: impl Into<String>) -> Result<T> {
     Err(ConfigurationError(message.into()))
 }
 
+/// A GPU exporter for one host: `[NAME=]URL`. Without a name it belongs to the first host.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuMetricsSource {
+    pub host: Option<String>,
+    pub url: ExporterUrl,
+    /// From the command line rather than `dtop.conf`: a host name nothing matches is an error
+    /// there, while a file entry for a host the command line left out is ignored.
+    pub from_command_line: bool,
+}
+
+impl GpuMetricsSource {
+    pub fn parse(value: &str, from_command_line: bool) -> Result<GpuMetricsSource> {
+        let (host, url) = match value.split_once('=') {
+            Some((name, url))
+                if !name.trim().is_empty() && !name.contains(':') && !name.contains('/') =>
+            {
+                (Some(name.trim().to_string()), url.trim())
+            }
+            _ => (None, value.trim()),
+        };
+        let url =
+            ExporterUrl::parse(url).map_err(|e| ConfigurationError(format!("gpu metrics: {e}")))?;
+        Ok(GpuMetricsSource {
+            host,
+            url,
+            from_command_line,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppConfiguration {
     /// Hosts to monitor (`--host`, `--context`, `host =`, `[host NAME]`). Empty means the
@@ -53,6 +84,9 @@ pub struct AppConfiguration {
     pub mouse: bool,
     /// Collect GPU metrics.
     pub gpu: bool,
+    /// Prometheus GPU exporters to read instead of measuring locally (`--gpu-metrics`,
+    /// `gpu_metrics =`), e.g. for remote hosts.
+    pub gpu_metrics: Vec<GpuMetricsSource>,
     pub show_stopped: bool,
     pub sort_key: SortKey,
     /// None means "the natural direction for the sort key".
@@ -74,6 +108,7 @@ impl Default for AppConfiguration {
             color_mode: None,
             mouse: true,
             gpu: true,
+            gpu_metrics: Vec::new(),
             show_stopped: true,
             sort_key: SortKey::Cpu,
             sort_descending: None,
@@ -111,6 +146,9 @@ OPTIONS:
       --sort <key>          Initial sort: name, cpu, memory, gpu, status, created, image
       --no-mouse            Disable mouse reporting
       --no-gpu              Don't collect GPU metrics (NVIDIA, AMD, Intel, Apple)
+      --gpu-metrics [name=]<url>
+                            Read a host's GPUs from a DCGM or AMD Device Metrics exporter
+                            (http://gpu-box:9400/metrics). Repeatable; without a name, the first host
       --history <samples>   Samples kept per graph (30-3600, default 240)
   -c, --config <file>       Read settings from this file instead of the default location
       --once                Print one plain-text snapshot and exit (scriptable)
@@ -218,6 +256,13 @@ impl AppConfiguration {
                 value = &value[1..value.len() - 1];
             }
             let result = match section {
+                Some(index) if key == "gpu_metrics" => {
+                    let name = self.hosts[index].name.clone();
+                    GpuMetricsSource::parse(value, false).map(|mut source| {
+                        source.host = name;
+                        self.gpu_metrics.push(source);
+                    })
+                }
                 Some(index) => apply_host_key(&key, value, &mut self.hosts[index]),
                 None => self.apply_key(&key, value),
             };
@@ -283,6 +328,14 @@ impl AppConfiguration {
             }
             "mouse" => self.mouse = parse_bool(value, key)?,
             "gpu" => self.gpu = parse_bool(value, key)?,
+            "gpu_metrics" => {
+                if value.is_empty() {
+                    self.gpu_metrics.clear();
+                } else {
+                    self.gpu_metrics
+                        .push(GpuMetricsSource::parse(value, false)?);
+                }
+            }
             "show_stopped" | "all" => self.show_stopped = parse_bool(value, key)?,
             "sort" => {
                 self.sort_key = SortKey::parse(&value.to_lowercase()).ok_or_else(|| {
@@ -408,6 +461,10 @@ impl AppConfiguration {
                 "--no-mouse" => self.mouse = false,
                 "--mouse" => self.mouse = true,
                 "--no-gpu" => self.gpu = false,
+                "--gpu-metrics" => {
+                    let v = value(&mut index)?;
+                    self.gpu_metrics.push(GpuMetricsSource::parse(&v, true)?);
+                }
                 "--gpu" => self.gpu = true,
                 "--history" => {
                     let v = value(&mut index)?;
@@ -465,7 +522,7 @@ fn apply_host_key(key: &str, value: &str, host: &mut HostRequest) -> Result<()> 
         _ => {
             if !apply_tls_key(key, value, &mut host.tls)? {
                 return err(format!(
-                    "'{key}' is not valid in a [host] section — use endpoint, context, tls, tlsverify, tlscacert, tlscert, tlskey or cert_path"
+                    "'{key}' is not valid in a [host] section — use endpoint, context, gpu_metrics, tls, tlsverify, tlscacert, tlscert, tlskey or cert_path"
                 ));
             }
         }
@@ -479,6 +536,41 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn gpu_exporters_come_from_flags_global_keys_and_host_sections() {
+        let mut c = AppConfiguration::default();
+        c.apply_config_file(
+            "gpu_metrics = http://first:9400/metrics\n[host prod]\nendpoint = tcp://p:2376\ngpu_metrics = https://p:5000\n",
+        )
+        .unwrap();
+        c.apply_arguments(&args(&["--gpu-metrics", "lab=http://[::1]:9400/m"]))
+            .unwrap();
+        let sources: Vec<(Option<&str>, String, bool)> = c
+            .gpu_metrics
+            .iter()
+            .map(|s| (s.host.as_deref(), s.url.to_string(), s.from_command_line))
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                (None, "http://first:9400/metrics".to_string(), false),
+                (Some("prod"), "https://p:5000/metrics".to_string(), false),
+                (Some("lab"), "http://[::1]:9400/m".to_string(), true),
+            ]
+        );
+        // An unnamed URL whose query contains '=' is not mistaken for NAME=URL.
+        let source = GpuMetricsSource::parse("http://h:9400/metrics?x=1", true).unwrap();
+        assert_eq!(source.host, None);
+        assert_eq!(source.url.path, "/metrics?x=1");
+        let error = AppConfiguration::default()
+            .apply_arguments(&args(&["--gpu-metrics", "gpu-box:9400"]))
+            .unwrap_err();
+        assert!(error.0.contains("http://HOST:PORT/metrics"), "{}", error.0);
+        assert!(AppConfiguration::default()
+            .apply_config_file("[host x]\nendpoint = tcp://a:1\ngpu_metrics = nope\n")
+            .is_err());
     }
 
     #[test]
