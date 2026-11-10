@@ -90,6 +90,21 @@ Option 3, behind a `GPUCollecting` protocol:
   cannot be read, the Rust version reports them as unknown rather than an undercount, and the
   GPU box says root is needed. Group membership (`render`, `video`) does not help: fdinfo is
   guarded by ptrace access checks, not by the device node's permissions (amended 2026-11-09).
+- **ROCm compute bypasses fdinfo engine time.** KFD user-mode queues don't go through the DRM
+  scheduler, so ROCm work shows in the device's `gpu_busy_percent` but not in per-process
+  `drm-engine-*`. The Rust version also reads amdkfd's world-readable
+  `/sys/class/kfd/kfd/proc/<pid>/` (`vram_<gpu_id>`, `stats_<gpu_id>/cu_occupancy`), maps
+  `gpu_id` to a PCI address through the KFD topology (`domain`, `location_id`), and turns CU
+  occupancy into a share of the GPU's compute units. It is a snapshot of occupancy, not busy
+  time (amended 2026-11-10).
+- **NVIDIA graphics processes**: `--query-compute-apps` lists compute processes only. The Rust
+  version runs `pmon -s um` and takes graphics processes' memory from its `fb` column
+  (amended 2026-11-10).
+- **Remote hosts through exporters**: the Rust version can read a host's GPUs from a DCGM
+  Exporter or AMD Device Metrics Exporter (`--gpu-metrics`, `gpu_metrics =`), parsing the
+  Prometheus text format itself. It reads device readings only, because the exporters attribute
+  usage to Kubernetes pods, not Docker containers. This lifts the "no GPU data for remote
+  daemons" limit for hosts that run an exporter (amended 2026-11-10).
 - **Not covered yet**: AMD and Intel on Windows (would use `\GPU Engine(*)\Utilization Percentage`
   performance counters), and GPU power and temperature beyond NVIDIA's.
 - **Verification so far**: unit tests and an end-to-end run with a stand-in `nvidia-smi`. Real

@@ -286,6 +286,8 @@ all_contexts = false
 [host prod]
 endpoint = tcp://prod.example.com:2376
 cert_path = /home/me/.docker/prod
+# GPUs of a remote host, from its DCGM or AMD Device Metrics exporter (Rust version).
+gpu_metrics = http://prod.example.com:9400/metrics
 ```
 
 Sections come after the global settings. Hosts on the command line replace the file's hosts.
@@ -494,10 +496,11 @@ supported yet, — = not applicable.
 | Mouse (SGR reporting, split reports over SSH) | ✓ | ✓ | ✓ | unit · e2e |
 | 10 themes, theme menu with live preview, save/revert | ✓ | ✓ | ✓ | unit · e2e |
 | Truecolor → 256 → 16-color fallback, `NO_COLOR` | ✓ | ✓ | ✓ | unit |
-| GPU graph + per-container GPU%: NVIDIA (`nvidia-smi`) | — | ✓ | host graph only ¹ | unit · e2e (stand-in `nvidia-smi`) |
-| GPU graph + per-container GPU%: AMD (amdgpu sysfs + DRM fdinfo) | — | ✓ ² | ✗ | unit (kernel-format fixtures) |
+| GPU graph + per-container GPU%: NVIDIA (`nvidia-smi`; per-process memory includes graphics processes) | — | ✓ | host graph only ¹ | unit · e2e (stand-in `nvidia-smi`) |
+| GPU graph + per-container GPU%: AMD (amdgpu sysfs + DRM fdinfo; ROCm compute through KFD sysfs) | — | ✓ ² | ✗ | unit (kernel-format fixtures) |
 | GPU graph + per-container GPU%: Intel (DRM fdinfo, i915 and xe) | — | ✓ ² | ✗ | unit (kernel-documented examples) |
 | GPU graph: Apple Silicon (IOKit `IOAccelerator`) | host graph only ³ | — | — | unit (parser); IOKit code builds in macOS CI |
+| GPU graph for any host, remote ones included, from a DCGM or AMD Device Metrics exporter (`--gpu-metrics`, Rust) | ✓ ⁴ | ✓ ⁴ | ✓ ⁴ | unit · e2e (stand-in DCGM exporter) |
 | Config file location | `~/.config/dtop` | `$XDG_CONFIG_HOME/dtop` or `~/.config/dtop` | `%APPDATA%\dtop` | unit |
 | `dtop --once` plain-text report | ✓ | ✓ | ✓ | CI against a real daemon (Linux) |
 | Reconnect with backoff when the daemon goes away | ✓ | ✓ | ✓ | unit |
@@ -512,19 +515,37 @@ GPU notes:
    Without root, dtop still shows the GPU graph and says in the GPU box why per-container
    values are missing. Intel GPUs have no busy-percent file, so their utilization is summed
    from those same fdinfo files: without root, the Rust version shows it as `n/a` instead of a
-   number that leaves out other users' processes. AMD's `rocm_smi_lib` isn't used: it is in maintenance mode (critical
-   fixes only since ROCm 7.0), and both it and its successor AMD SMI read the same amdgpu sysfs
-   counters dtop reads directly. See [ADR 0002](.github/plans/0002-gpu-monitoring-sources.md).
+   number that leaves out other users' processes.
+
+   ROCm compute work bypasses the kernel scheduler that fdinfo's busy counters come from, so
+   the Rust version also reads amdkfd's world-readable `/sys/class/kfd/kfd/proc/<pid>/`. Each
+   ROCm process gets its VRAM (`vram_<gpu>`) and, as its utilization, the share of the GPU's
+   compute units it occupies at that moment (`stats_<gpu>/cu_occupancy` over the CU count in
+   the KFD topology). A process seen both there and in fdinfo is counted once, with the larger
+   of each reading. AMD's `rocm_smi_lib` isn't used: it is in maintenance mode (critical fixes
+   only since ROCm 7.0), and both it and its successor AMD SMI read the same kernel files dtop
+   reads directly. See [ADR 0002](.github/plans/0002-gpu-monitoring-sources.md).
 3. macOS shows the Mac's own GPU. Containers on macOS run in Docker Desktop's Linux VM, which
    has no GPU access, so there is nothing to attribute per container. The `IOAccelerator`
    statistics are undocumented, so missing values show as unknown.
 4. Per-container attribution only works when dtop runs on the Docker host itself (same PID
-   namespace). It does not work when dtop connects to a remote daemon.
+   namespace). It does not work when dtop connects to a remote daemon. For a remote host, the
+   Rust version can show the host's GPUs from an exporter running there: NVIDIA's DCGM
+   Exporter (current and older metric names) or AMD's Device Metrics Exporter, with
+   `--gpu-metrics [NAME=]URL` (repeatable; without a name, the first host) or
+   `gpu_metrics = URL` in a `[host NAME]` section. dtop reads device utilization, memory and
+   temperature from it. The exporters attribute GPU use to Kubernetes pods rather than Docker
+   containers, so per-container values stay `-`. An exporter replaces local measurement for
+   its host; scrapes time out after 5 seconds.
 5. Each `nvidia-smi` query may take 5 seconds in the Rust version. One that takes longer (a hung
    NVIDIA driver) is stopped, the GPUs stay listed as `n/a` with the reason in the GPU box, and
    `nvidia-smi` is tried again 30 seconds later (and not while a stopped one is still stuck in
-   the driver), so container monitoring keeps updating.
-6. None of this has been tested on real GPU hardware yet; this environment has no GPU.
+   the driver), so container monitoring keeps updating. Per-process memory comes from
+   `--query-compute-apps` for compute processes and from `pmon -s um`'s `fb` column for
+   graphics ones, which the compute query leaves out.
+
+   None of the GPU support has been tested on real GPU hardware yet; this environment has no
+   GPU.
 6. Linux uses OpenSSL (loaded at runtime), macOS Network.framework, Windows SChannel. All three
    negotiate TLS 1.3 where the OS supports it (Windows 11 / Server 2022) and fall back to 1.2.
    See [ADR 0003](.github/plans/0003-tls-on-platform-stacks.md).

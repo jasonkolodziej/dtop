@@ -175,7 +175,20 @@ pub mod nvidia_smi {
         "--format=csv,noheader,nounits",
     ];
     /// One sample of per-process utilization (`sm` column).
-    pub const PROCESS_MONITOR_ARGUMENTS: [&str; 5] = ["pmon", "-c", "1", "-s", "u"];
+    /// `u`: SM utilization; `m`: framebuffer memory (`fb`, MiB), which also covers graphics
+    /// processes that `--query-compute-apps` leaves out.
+    pub const PROCESS_MONITOR_ARGUMENTS: [&str; 5] = ["pmon", "-c", "1", "-s", "um"];
+
+    /// One `pmon` row.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ProcessSample {
+        pub gpu: i64,
+        pub pid: i64,
+        /// SM utilization, %.
+        pub sm: Option<f64>,
+        /// Framebuffer memory, bytes.
+        pub memory: Option<u64>,
+    }
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct Device {
@@ -242,8 +255,9 @@ pub mod nvidia_smi {
             .collect()
     }
 
-    /// `nvidia-smi pmon -c 1 -s u` → (gpu index, pid, SM utilization); `-` means no sample.
-    pub fn parse_process_monitor(output: &str) -> Vec<(i64, i64, Option<f64>)> {
+    /// `nvidia-smi pmon -c 1 -s um` rows. Columns are found by the header's names (drivers add
+    /// columns such as `jpg`, `ofa` and `ccpm`); `-` means no sample.
+    pub fn parse_process_monitor(output: &str) -> Vec<ProcessSample> {
         let mut columns: Vec<String> = Vec::new();
         let mut rows = Vec::new();
         for raw in output.lines() {
@@ -255,17 +269,28 @@ pub mod nvidia_smi {
                 continue;
             }
             let fields: Vec<&str> = line.split_whitespace().collect();
-            let position = |name: &str, default: usize| {
-                columns.iter().position(|c| c == name).unwrap_or(default)
+            let position = |name: &str, default: Option<usize>| {
+                columns.iter().position(|c| c == name).or(default)
             };
-            let (gpu, pid, sm) = (position("gpu", 0), position("pid", 1), position("sm", 3));
-            if fields.len() <= gpu.max(pid).max(sm) {
-                continue;
-            }
-            let (Ok(index), Ok(p)) = (fields[gpu].parse(), fields[pid].parse()) else {
+            let (Some(gpu), Some(pid)) = (position("gpu", Some(0)), position("pid", Some(1)))
+            else {
                 continue;
             };
-            rows.push((index, p, number(fields[sm])));
+            let field = |index: Option<usize>| index.and_then(|i| fields.get(i).copied());
+            let (Some(Ok(index)), Some(Ok(p))) = (
+                field(Some(gpu)).map(str::parse::<i64>),
+                field(Some(pid)).map(str::parse::<i64>),
+            ) else {
+                continue;
+            };
+            rows.push(ProcessSample {
+                gpu: index,
+                pid: p,
+                sm: field(position("sm", Some(3))).and_then(number),
+                memory: field(position("fb", None))
+                    .and_then(number)
+                    .map(|mib| (mib * MIB) as u64),
+            });
         }
         rows
     }
@@ -595,6 +620,9 @@ pub struct SystemGpuCollector {
     runner: Arc<dyn CommandRunning>,
     proc_root: String,
     drm_root: String,
+    /// amdkfd's sysfs (`/sys/class/kfd/kfd`): per-process data for ROCm compute work, which
+    /// bypasses the DRM scheduler and so never shows in fdinfo engine time.
+    kfd_root: String,
     tracker: Mutex<DrmUsageTracker>,
     /// Bound on each `nvidia-smi` query (`NVIDIA_SMI_TIMEOUT` unless a test shortens it).
     pub nvidia_smi_timeout: Duration,
@@ -621,6 +649,7 @@ impl SystemGpuCollector {
             runner,
             proc_root: proc_root.into(),
             drm_root: drm_root.into(),
+            kfd_root: "/sys/class/kfd/kfd".into(),
             tracker: Mutex::new(DrmUsageTracker::default()),
             nvidia_smi_timeout: NVIDIA_SMI_TIMEOUT,
             nvidia_smi_retry_at: Mutex::new(None),
@@ -834,20 +863,25 @@ impl SystemGpuCollector {
                 },
             );
         }
-        for (index, pid, utilization) in monitor {
-            let Some(uuid) = uuid_by_index.get(&index) else {
+        for row in monitor {
+            let Some(uuid) = uuid_by_index.get(&row.gpu) else {
                 continue;
             };
             let entry = usage
-                .entry(format!("{uuid}#{pid}"))
+                .entry(format!("{uuid}#{}", row.pid))
                 .or_insert_with(|| GpuProcessUsage {
-                    pid,
+                    pid: row.pid,
                     device_id: format!("nvidia:{uuid}"),
                     utilization: None,
                     memory_bytes: None,
                     container_id: None,
                 });
-            entry.utilization = utilization;
+            entry.utilization = row.sm;
+            // --query-compute-apps is exact for compute processes; pmon's `fb` fills in the
+            // graphics (and compute+graphics) ones it does not list.
+            if entry.memory_bytes.is_none() {
+                entry.memory_bytes = row.memory;
+            }
         }
         let mut processes: Vec<GpuProcessUsage> = usage.into_values().collect();
         processes.sort_by_key(|p| p.pid);
@@ -1014,6 +1048,16 @@ impl SystemGpuCollector {
                 container_id: self.container_id(pid),
             });
         }
+        if cards.iter().any(|(d, _)| d.vendor == GpuVendor::Amd) {
+            let amd: HashSet<String> = cards
+                .iter()
+                .filter(|(d, _)| d.vendor == GpuVendor::Amd)
+                .map(|(_, pdev)| pdev.clone())
+                .collect();
+            for process in self.collect_kfd(&amd, &mut unreadable) {
+                merge_process(&mut processes, process);
+            }
+        }
         // Intel has no busy-percent file: device utilization and memory are summed from its
         // clients. With any process unreadable (any non-root run) that sum misses whatever those
         // processes do — containers, usually — so it is unknown rather than a low number.
@@ -1051,6 +1095,90 @@ impl SystemGpuCollector {
         }
     }
 
+    /// ROCm (KFD) processes on the AMD GPUs in `amd` (PCI addresses): VRAM from
+    /// `proc/<pid>/vram_<gpu_id>`, and utilization as the share of compute units the process
+    /// occupies at this moment (`stats_<gpu_id>/cu_occupancy` over the GPU's CU count from the
+    /// topology). The files are world-readable; a refused one counts as unreadable.
+    fn collect_kfd(&self, amd: &HashSet<String>, unreadable: &mut usize) -> Vec<GpuProcessUsage> {
+        let topology = format!("{}/topology/nodes", self.kfd_root);
+        let mut gpus: HashMap<String, (String, Option<u64>)> = HashMap::new();
+        for node in self.file_system.list(&topology).unwrap_or_default() {
+            let read = |file: &str| self.file_system.read(&format!("{topology}/{node}/{file}"));
+            let Some(gpu_id) = read("gpu_id").map(|g| g.trim().to_string()) else {
+                continue;
+            };
+            if gpu_id.is_empty() || gpu_id == "0" {
+                continue; // a CPU node
+            }
+            let properties = kfd_properties(&read("properties").unwrap_or_default());
+            let Some(pdev) = kfd_pci_address(&properties) else {
+                continue;
+            };
+            if !amd.contains(&pdev) {
+                continue;
+            }
+            let compute_units = match (properties.get("simd_count"), properties.get("simd_per_cu"))
+            {
+                (Some(&simds), Some(&per_cu)) if per_cu > 0 && simds >= per_cu => {
+                    Some(simds / per_cu)
+                }
+                _ => None,
+            };
+            gpus.insert(gpu_id, (pdev, compute_units));
+        }
+        if gpus.is_empty() {
+            return Vec::new();
+        }
+        let proc_dir = format!("{}/proc", self.kfd_root);
+        let pids = match self.file_system.list_access(&proc_dir) {
+            Access::Found(pids) => pids,
+            Access::Denied => {
+                *unreadable += 1;
+                return Vec::new();
+            }
+            Access::Missing => return Vec::new(),
+        };
+        let mut processes = Vec::new();
+        for entry in pids {
+            let Ok(pid) = entry.parse::<i64>() else {
+                continue;
+            };
+            for (gpu_id, (pdev, compute_units)) in &gpus {
+                let base = format!("{proc_dir}/{pid}");
+                let vram = match self
+                    .file_system
+                    .read_access(&format!("{base}/vram_{gpu_id}"))
+                {
+                    Access::Found(v) => v.trim().parse::<u64>().ok(),
+                    Access::Denied => {
+                        *unreadable += 1;
+                        None
+                    }
+                    // The process does not use this GPU (or exited).
+                    Access::Missing => continue,
+                };
+                let occupied = self
+                    .file_system
+                    .read(&format!("{base}/stats_{gpu_id}/cu_occupancy"))
+                    .and_then(|v| v.trim().parse::<u64>().ok());
+                let utilization = match (occupied, compute_units) {
+                    (Some(used), Some(total)) => {
+                        Some((used as f64 / *total as f64 * 100.0).min(100.0))
+                    }
+                    _ => None,
+                };
+                processes.push(GpuProcessUsage {
+                    pid,
+                    device_id: format!("drm:{pdev}"),
+                    utilization,
+                    memory_bytes: vram,
+                    container_id: self.container_id(pid),
+                });
+            }
+        }
+        processes
+    }
+
     fn container_id(&self, pid: i64) -> Option<String> {
         self.file_system
             .read(&format!("{}/{pid}/cgroup", self.proc_root))
@@ -1080,6 +1208,54 @@ impl GpuCollecting for SystemGpuCollector {
             result.process_attribution_complete = false;
         }
         result
+    }
+}
+
+/// `key value` lines of a KFD topology `properties` file.
+pub fn kfd_properties(text: &str) -> HashMap<String, u64> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let key = parts.next()?;
+            let value = parts.next()?.parse().ok()?;
+            Some((key.to_string(), value))
+        })
+        .collect()
+}
+
+/// The PCI address (`0000:03:00.0`) of a KFD topology node: `domain` and `location_id`
+/// (bus << 8 | device << 3 | function), as in `PCI_SLOT_NAME`.
+pub fn kfd_pci_address(properties: &HashMap<String, u64>) -> Option<String> {
+    let location = *properties.get("location_id")?;
+    let domain = properties.get("domain").copied().unwrap_or(0);
+    Some(format!(
+        "{domain:04x}:{:02x}:{:02x}.{:x}",
+        (location >> 8) & 0xff,
+        (location >> 3) & 0x1f,
+        location & 0x7
+    ))
+}
+
+/// Adds `process` to `processes`, combining it with an entry for the same process and GPU
+/// from another source (DRM fdinfo and KFD both see ROCm processes): the larger reading of
+/// each wins, so nothing is counted twice.
+fn merge_process(processes: &mut Vec<GpuProcessUsage>, process: GpuProcessUsage) {
+    let larger_f = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    match processes
+        .iter_mut()
+        .find(|p| p.pid == process.pid && p.device_id == process.device_id)
+    {
+        Some(existing) => {
+            existing.utilization = larger_f(existing.utilization, process.utilization);
+            existing.memory_bytes = match (existing.memory_bytes, process.memory_bytes) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        None => processes.push(process),
     }
 }
 
@@ -1346,7 +1522,30 @@ mod tests {
         let pmon = nvidia_smi::parse_process_monitor(
             "# gpu pid type sm mem enc dec command\n# Idx # C/G % % % % name\n    0   4242   C   45  12  -  -  python\n    0   99  C  -  -  -  -  x\n",
         );
-        assert_eq!(pmon, vec![(0, 4242, Some(45.0)), (0, 99, None)]);
+        let row = |gpu, pid, sm, memory| nvidia_smi::ProcessSample {
+            gpu,
+            pid,
+            sm,
+            memory,
+        };
+        assert_eq!(
+            pmon,
+            vec![row(0, 4242, Some(45.0), None), row(0, 99, None, None)]
+        );
+        // `-s um` on a current driver: extra columns, and fb (MiB) for a graphics process.
+        let pmon = nvidia_smi::parse_process_monitor(
+            "# gpu         pid   type     sm    mem    enc    dec    jpg    ofa     fb   ccpm    command\n\
+             # Idx           #    C/G      %      %      %      %      %      %     MB     MB    name\n\
+                 0       1234     G      3      1      -      -      -      -     45      0    Xorg\n\
+                 0       4242     C     60     20      -      -      -      -   2048      0    python\n",
+        );
+        assert_eq!(
+            pmon,
+            vec![
+                row(0, 1234, Some(3.0), Some(45 * 1_048_576)),
+                row(0, 4242, Some(60.0), Some(2048 * 1_048_576)),
+            ]
+        );
         assert_eq!(
             nvidia_smi::parse_compute_apps("4242, GPU-abc, 1536\n"),
             vec![(4242, "GPU-abc".into(), Some(1536 * 1_048_576))]
@@ -1530,6 +1729,9 @@ mod tests {
         pmon_hung: std::sync::atomic::AtomicBool,
         calls: std::sync::atomic::AtomicUsize,
         abandoned: std::sync::atomic::AtomicUsize,
+        /// `--query-compute-apps` and `pmon` output.
+        apps: String,
+        pmon: String,
     }
 
     impl CommandRunning for ScriptedSmi {
@@ -1547,10 +1749,13 @@ mod tests {
             if self.hung.load(Ordering::SeqCst) || (pmon && self.pmon_hung.load(Ordering::SeqCst)) {
                 return Err(DockerError::TimedOut(invocation.display_string()));
             }
-            let output = if invocation.arguments[0].starts_with("--query-gpu") {
+            let argument = invocation.arguments[0].as_str();
+            let output = if argument.starts_with("--query-gpu") {
                 "0, GPU-abc, NVIDIA RTX, 45, 1024, 2048, 61\n"
+            } else if argument.starts_with("--query-compute-apps") {
+                self.apps.as_str()
             } else {
-                ""
+                self.pmon.as_str()
             };
             Ok(CommandResult {
                 exit_code: 0,
@@ -1606,6 +1811,137 @@ mod tests {
         assert_eq!(sample.devices.len(), 1);
         assert_eq!(sample.devices[0].utilization, Some(7.0));
         assert!(!sample.process_attribution_complete);
+    }
+
+    #[test]
+    fn graphics_processes_get_memory_from_pmon_and_compute_ones_keep_the_exact_figure() {
+        let id = "c".repeat(64);
+        let mut files = BTreeMap::new();
+        files.insert(
+            "/proc/1234/cgroup".to_string(),
+            format!("0::/docker/{id}\n"),
+        );
+        let smi = Arc::new(ScriptedSmi {
+            apps: "4242, GPU-abc, 1536\n".into(),
+            pmon: "# gpu  pid  type  sm  mem  enc  dec  jpg  ofa  fb  ccpm  command\n\
+                   # Idx    #   C/G   %    %    %    %    %    %  MB    MB  name\n\
+                       0  1234    G   3    1    -    -    -    -  45     0  glxgears\n\
+                       0  4242    C  60   20    -    -    -    -  2000   0  python\n"
+                .into(),
+            ..ScriptedSmi::default()
+        });
+        let collector = nvidia_collector(&smi, FakeFs(files, BTreeMap::new()));
+        let sample = collector.sample(0.0);
+        let process = |pid| sample.processes.iter().find(|p| p.pid == pid).unwrap();
+        // A graphics process --query-compute-apps does not list: memory from pmon's fb.
+        assert_eq!(process(1234).memory_bytes, Some(45 * 1_048_576));
+        assert_eq!(process(1234).utilization, Some(3.0));
+        assert_eq!(process(1234).container_id.as_deref(), Some(id.as_str()));
+        // A compute process keeps --query-compute-apps' exact figure.
+        assert_eq!(process(4242).memory_bytes, Some(1536 * 1_048_576));
+        assert_eq!(process(4242).utilization, Some(60.0));
+        assert_eq!(sample.usage_by_container()[&id], (3.0, 45 * 1_048_576));
+    }
+
+    /// An AMD GPU at 0000:03:00.0 with 76 compute units, whose KFD process 77 (in a container)
+    /// uses 2 GiB of VRAM and occupies 19 CUs.
+    fn amd_kfd_files(id: &str) -> BTreeMap<String, String> {
+        let mut files = BTreeMap::new();
+        let card = "/sys/class/drm/card1/device";
+        files.insert(format!("{card}/vendor"), "0x1002\n".into());
+        files.insert(
+            format!("{card}/uevent"),
+            "PCI_SLOT_NAME=0000:03:00.0\n".into(),
+        );
+        files.insert(format!("{card}/gpu_busy_percent"), "40\n".into());
+        let kfd = "/sys/class/kfd/kfd";
+        files.insert(format!("{kfd}/topology/nodes/0/gpu_id"), "0\n".into());
+        files.insert(
+            format!("{kfd}/topology/nodes/0/properties"),
+            "cpu_cores_count 16\n".into(),
+        );
+        files.insert(format!("{kfd}/topology/nodes/1/gpu_id"), "53418\n".into());
+        files.insert(
+            format!("{kfd}/topology/nodes/1/properties"),
+            "simd_count 304\nsimd_per_cu 4\nlocation_id 768\ndomain 0\n".into(),
+        );
+        files.insert(format!("{kfd}/proc/77/vram_53418"), "2147483648\n".into());
+        files.insert(
+            format!("{kfd}/proc/77/stats_53418/cu_occupancy"),
+            "19\n".into(),
+        );
+        files.insert("/proc/77/cgroup".to_string(), format!("0::/docker/{id}\n"));
+        files
+    }
+
+    #[test]
+    fn rocm_processes_are_read_from_kfd() {
+        let id = "d".repeat(64);
+        let collector = SystemGpuCollector::new(
+            Platform::Linux,
+            None,
+            Arc::new(FakeFs(amd_kfd_files(&id), BTreeMap::new())),
+            Arc::new(NoRunner),
+            "/proc",
+            "/sys/class/drm",
+        );
+        let sample = collector.sample(0.0);
+        assert_eq!(sample.devices.len(), 1);
+        assert_eq!(sample.devices[0].utilization, Some(40.0));
+        assert_eq!(sample.processes.len(), 1);
+        let p = &sample.processes[0];
+        assert_eq!(p.pid, 77);
+        assert_eq!(p.device_id, "drm:0000:03:00.0");
+        assert_eq!(p.memory_bytes, Some(2 * 1024 * 1_048_576));
+        assert!((p.utilization.unwrap() - 25.0).abs() < 1e-9);
+        assert!(sample.process_attribution_complete);
+        let (utilization, memory) = sample.usage_by_container()[&id];
+        assert!((utilization - 25.0).abs() < 1e-9);
+        assert_eq!(memory, 2 * 1024 * 1_048_576);
+    }
+
+    #[test]
+    fn a_process_seen_by_both_fdinfo_and_kfd_is_counted_once() {
+        let id = "e".repeat(64);
+        let mut files = amd_kfd_files(&id);
+        // The same process also holds the render node, with 16 MiB of VRAM there.
+        files.insert(
+            "/proc/77/fdinfo/9".into(),
+            "drm-driver: amdgpu\ndrm-client-id: 5\ndrm-pdev: 0000:03:00.0\ndrm-engine-gfx: 0 ns\ndrm-memory-vram: 16 MiB\n".into(),
+        );
+        let links: BTreeMap<String, String> = [(
+            "/proc/77/fd/9".to_string(),
+            "/dev/dri/renderD129".to_string(),
+        )]
+        .into();
+        let collector = SystemGpuCollector::new(
+            Platform::Linux,
+            None,
+            Arc::new(FakeFs(files, links)),
+            Arc::new(NoRunner),
+            "/proc",
+            "/sys/class/drm",
+        );
+        let sample = collector.sample(0.0);
+        assert_eq!(sample.processes.len(), 1, "{:?}", sample.processes);
+        assert_eq!(sample.processes[0].memory_bytes, Some(2 * 1024 * 1_048_576));
+        assert!((sample.processes[0].utilization.unwrap() - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kfd_topology_gives_pci_addresses() {
+        let properties = kfd_properties("location_id 768\ndomain 0\nsimd_count 304\n");
+        assert_eq!(
+            kfd_pci_address(&properties).as_deref(),
+            Some("0000:03:00.0")
+        );
+        // bus 0xc1, device 0, function 1, domain 1.
+        let properties = kfd_properties(&format!("location_id {}\ndomain 1\n", (0xc1 << 8) | 1));
+        assert_eq!(
+            kfd_pci_address(&properties).as_deref(),
+            Some("0001:c1:00.1")
+        );
+        assert_eq!(kfd_pci_address(&kfd_properties("simd_count 4\n")), None);
     }
 
     #[test]
